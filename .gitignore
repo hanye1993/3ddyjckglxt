@@ -1,0 +1,63 @@
+# Dependencies
+node_modules/
+
+# Electron / Vite build
+dist/
+out/
+release/
+*.tsbuildinfo
+
+# Logs & env
+*.log
+npm-debug.log*
+.DS_Store
+Thumbs.db
+.env
+.env.*
+*.local
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+Desktop.ini
+
+# Local / runtime data (never commit)
+data/
+userdata/
+downloads/
+frpc/
+secrets.bin
+devices.json
+filament-spools.json
+monitor-zones.json
+app-settings.json
+operation-logs.jsonl
+data-location.json
+*.bin
+
+# Cursor / agent scratch
+.transcript-extract/
+.cursor/
+.tools/
+
+# Android (also covered by clients/android/.gitignore)
+clients/android/local.properties
+clients/android/.gradle/
+clients/android/build/
+clients/android/app/build/
+clients/android/**/captures/
+*.apk
+*.aab
+*.jks
+*.keystore
+
+# Keep packaging assets (do not ignore)
+!build/vc_redist.x64.exe
+!build/installer.nsh
+
+# PHP local config
+clients/php/config.php

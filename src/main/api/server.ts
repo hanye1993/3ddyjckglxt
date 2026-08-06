@@ -1,0 +1,1240 @@
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'http'
+import { randomUUID } from 'crypto'
+import { existsSync, readFileSync, writeFileSync } from 'fs'
+import { networkInterfaces } from 'os'
+import {
+  calcQuoteCosts,
+  parseGcodeMeta,
+  spoolPricePerKg,
+  QUOTE_MATERIAL_PRESETS,
+  QUOTE_PRINTER_PRESETS,
+  type PricingMode,
+  type QuoteCalcParams
+} from './quoteCalc'
+import {
+  handleMonitorApi,
+  monitorSummaryCounts,
+  type MonitorApiDeps
+} from './monitorApi'
+
+import {
+  DEVICE_CONTROL_ACTIONS,
+  isControlAction,
+  parseControlExtras,
+  type DeviceControlAction
+} from './controlShared'
+import { handleFullApi, type FullApiDeps } from './fullApi'
+
+export type { DeviceControlAction }
+export { DEVICE_CONTROL_ACTIONS }
+
+export type ApiMode = 'readonly' | 'control'
+
+export type ApiAccessMode = 'local' | 'sunlogin' | 'frpc'
+
+export type HskFwType = 1 | 2 | 3
+
+export type FrpcProxyType = 'tcp' | 'http'
+
+export type AppSettings = {
+  apiEnabled: boolean
+  apiMode: ApiMode
+  apiPort: number
+  apiKey: string
+  apiAccessMode?: ApiAccessMode
+  publicIp?: string
+  domain?: string
+  hskEnabled?: boolean
+  hskApiKey?: string
+  hskDomain?: string
+  hskExternalPort?: number
+  hskFwType?: HskFwType
+  hskMemo?: string
+  frpcServerAddr?: string
+  frpcServerPort?: number
+  frpcToken?: string
+  frpcType?: FrpcProxyType
+  frpcRemotePort?: number
+  frpcPublicHost?: string
+  frpcCustomDomain?: string
+  /** 桌面通知 */
+  notifyOnError?: boolean
+  notifyOnPrintDone?: boolean
+  notifyOnIdle?: boolean
+  notifyOnLowFilament?: boolean
+  amsAutoDeduct?: boolean
+  /** 设备状态刷新间隔（秒），1–60，默认 3；推送类协议不受影响 */
+  deviceRefreshSec?: number
+  /** 开机自启 / 托盘 */
+  openAtLogin?: boolean
+  minimizeToTray?: boolean
+  /** 状态 Webhook（POST JSON） */
+  webhookEnabled?: boolean
+  webhookUrl?: string
+  /** 外观：主题 midnight|ocean|forest|amber|slate */
+  uiTheme?: string
+  /** 背景：default|color|image */
+  uiBgMode?: string
+  uiBgColor?: string
+  /** data URL 或空 */
+  uiBgImage?: string
+}
+
+/** Clamp and return device refresh interval in seconds */
+export function normalizeDeviceRefreshSec(v: unknown): number {
+  const n = Math.round(Number(v))
+  if (!Number.isFinite(n)) return 3
+  return Math.max(1, Math.min(60, n))
+}
+
+/** Milliseconds for poll timers */
+export function resolveDeviceRefreshMs(settings: { deviceRefreshSec?: number } | null | undefined): number {
+  return normalizeDeviceRefreshSec(settings?.deviceRefreshSec) * 1000
+}
+
+export type ApiStatus = {
+  running: boolean
+  port: number
+  mode: ApiMode
+  localUrls: string[]
+  publicUrl: string | null
+  domainUrl: string | null
+  hskUrl: string | null
+  frpcUrl: string | null
+  error?: string
+}
+
+export const HSK_DEFAULT_MEMO = 'hanye-3D打印机监控台-API'
+
+export type ControlRequestHandler = (
+  deviceId: string,
+  payload: unknown
+) => Promise<{ ok: boolean; message?: string }>
+
+type DeviceRow = {
+  id: string
+  name: string
+  brand: string
+  tech?: string
+  group?: string
+  tags?: string[]
+  connectionMode?: string
+  createdAt?: string
+  [key: string]: unknown
+}
+
+type SpoolRow = {
+  id: string
+  brandId?: string
+  material?: string
+  color?: string
+  colorHex?: string
+  totalGrams?: number
+  remainGrams?: number
+  rolls?: number
+  location?: string
+  price?: number
+  openedAt?: string
+  notes?: string
+  tech?: string
+  archived?: boolean
+  amsBinding?: { deviceId: string; slotId: number } | null
+  amsBindings?: { deviceId: string; slotId: number }[]
+  createdAt?: string
+  updatedAt?: string
+  [key: string]: unknown
+}
+
+function normalizeAmsBinding(
+  raw: unknown
+): { deviceId: string; slotId: number } | null | undefined {
+  if (raw === null) return null
+  if (raw === undefined) return undefined
+  if (!raw || typeof raw !== 'object') return null
+  const o = raw as Record<string, unknown>
+  const deviceId = String(o.deviceId || '').trim()
+  const slotId = Math.floor(Number(o.slotId))
+  if (!deviceId || !Number.isFinite(slotId) || slotId < 0) return null
+  return { deviceId, slotId }
+}
+
+function normalizeRolls(raw: unknown): number {
+  const n = Math.floor(Number(raw))
+  if (!Number.isFinite(n) || n < 1) return 1
+  return Math.min(99, n)
+}
+
+function normalizeAmsBindings(
+  raw: unknown,
+  fallback: { deviceId: string; slotId: number } | null | undefined,
+  rolls: number
+): { deviceId: string; slotId: number }[] {
+  const out: { deviceId: string; slotId: number }[] = []
+  const seen = new Set<string>()
+  const push = (b: { deviceId: string; slotId: number } | null | undefined): void => {
+    if (!b) return
+    const key = `${b.deviceId}:${b.slotId}`
+    if (seen.has(key)) return
+    seen.add(key)
+    out.push(b)
+  }
+  if (Array.isArray(raw)) {
+    for (const item of raw) {
+      const b = normalizeAmsBinding(item)
+      if (b) push(b)
+    }
+  }
+  if (!out.length && fallback) push(fallback)
+  return out.slice(0, rolls)
+}
+
+type StatusMap = Record<string, unknown>
+
+const DEFAULT_PORT = 17890
+
+export function resolveAccessMode(settings: AppSettings): ApiAccessMode {
+  if (
+    settings.apiAccessMode === 'local' ||
+    settings.apiAccessMode === 'sunlogin' ||
+    settings.apiAccessMode === 'frpc'
+  ) {
+    return settings.apiAccessMode
+  }
+  return settings.hskEnabled ? 'sunlogin' : 'local'
+}
+
+export function buildHskUrl(settings: AppSettings): string | null {
+  if (resolveAccessMode(settings) !== 'sunlogin') return null
+  const domain = (settings.hskDomain || '').trim()
+  if (!domain) return null
+  const host = domain.replace(/^https?:\/\//i, '').replace(/\/$/, '')
+  if (!host) return null
+  const fw = settings.hskFwType === 1 ? 1 : settings.hskFwType === 3 ? 3 : 2
+  const extPort = Number(settings.hskExternalPort) || 0
+  if (fw === 3) {
+    return extPort && extPort !== 443 ? `https://${host}:${extPort}` : `https://${host}`
+  }
+  if (fw === 2) {
+    return extPort && extPort !== 80 ? `http://${host}:${extPort}` : `http://${host}`
+  }
+  if (extPort > 0) return `http://${host}:${extPort}`
+  return `http://${host}`
+}
+
+export function buildFrpcUrl(settings: AppSettings): string | null {
+  if (resolveAccessMode(settings) !== 'frpc') return null
+  const type = settings.frpcType === 'http' ? 'http' : 'tcp'
+  if (type === 'http') {
+    const domain = (settings.frpcCustomDomain || settings.frpcPublicHost || '').trim()
+    if (!domain) return null
+    if (domain.includes('://')) return domain.replace(/\/$/, '')
+    return `http://${domain.replace(/\/$/, '')}`
+  }
+  const host = (settings.frpcPublicHost || '').trim().replace(/^https?:\/\//i, '').replace(/\/$/, '')
+  const remote = Number(settings.frpcRemotePort) || 0
+  if (!host || remote < 1) return null
+  return `http://${host}:${remote}`
+}
+
+/** 生成 frpc.toml（v0.52+），本地端口绑定本软件 API */
+export function buildFrpcToml(settings: AppSettings): string {
+  const serverAddr = (settings.frpcServerAddr || '').trim() || '127.0.0.1'
+  const serverPort = Number(settings.frpcServerPort) || 7000
+  const token = (settings.frpcToken || '').trim()
+  const localPort = settings.apiPort || DEFAULT_PORT
+  const type = settings.frpcType === 'http' ? 'http' : 'tcp'
+  const remotePort = Number(settings.frpcRemotePort) || 0
+  const customDomain = (settings.frpcCustomDomain || '').trim()
+
+  const lines = [
+    '# hanye-3D打印机监控台 — frpc 配置',
+    '# 用法: frpc -c frpc.toml',
+    '',
+    'serverAddr = "' + serverAddr.replace(/"/g, '') + '"',
+    'serverPort = ' + serverPort
+  ]
+  if (token) {
+    lines.push('', '[auth]', 'method = "token"', 'token = "' + token.replace(/"/g, '') + '"')
+  }
+  lines.push('', '[[proxies]]', 'name = "printer-monitor-api"', 'type = "' + type + '"')
+  lines.push('localIP = "127.0.0.1"', 'localPort = ' + localPort)
+  if (type === 'tcp') {
+    lines.push('remotePort = ' + (remotePort || localPort))
+  } else if (customDomain) {
+    lines.push('customDomains = ["' + customDomain.replace(/"/g, '') + '"]')
+  }
+  lines.push('')
+  return lines.join('\n')
+}
+
+export function defaultSettings(): AppSettings {
+  return {
+    apiEnabled: false,
+    apiMode: 'readonly',
+    apiPort: DEFAULT_PORT,
+    apiKey: randomUUID().replace(/-/g, ''),
+    apiAccessMode: 'local',
+    publicIp: '',
+    domain: '',
+    hskEnabled: false,
+    hskApiKey: '',
+    hskDomain: '',
+    hskExternalPort: 0,
+    hskFwType: 2,
+    hskMemo: HSK_DEFAULT_MEMO,
+    frpcServerAddr: '',
+    frpcServerPort: 7000,
+    frpcToken: '',
+    frpcType: 'tcp',
+    frpcRemotePort: 17890,
+    frpcPublicHost: '',
+    frpcCustomDomain: '',
+    notifyOnError: true,
+    notifyOnPrintDone: true,
+    notifyOnIdle: false,
+    notifyOnLowFilament: true,
+    amsAutoDeduct: true,
+    deviceRefreshSec: 3,
+    openAtLogin: false,
+    minimizeToTray: true,
+    webhookEnabled: false,
+    webhookUrl: '',
+    uiTheme: 'midnight',
+    uiBgMode: 'default',
+    uiBgColor: '#0f1115',
+    uiBgImage: ''
+  }
+}
+
+function normalizeHskFwType(v: unknown): HskFwType {
+  const n = Number(v)
+  if (n === 1 || n === 3) return n
+  return 2
+}
+
+function normalizeAccessMode(o: Record<string, unknown>): ApiAccessMode {
+  if (
+    o.apiAccessMode === 'sunlogin' ||
+    o.apiAccessMode === 'local' ||
+    o.apiAccessMode === 'frpc'
+  ) {
+    return o.apiAccessMode
+  }
+  return o.hskEnabled ? 'sunlogin' : 'local'
+}
+
+export function normalizeSettings(raw: unknown): AppSettings {
+  const base = defaultSettings()
+  if (!raw || typeof raw !== 'object') return base
+  const o = raw as Record<string, unknown>
+  const port = Number(o.apiPort)
+  const ext = Number(o.hskExternalPort)
+  const frpcServerPort = Number(o.frpcServerPort)
+  const frpcRemotePort = Number(o.frpcRemotePort)
+  const apiAccessMode = normalizeAccessMode(o)
+  return {
+    apiEnabled: Boolean(o.apiEnabled),
+    apiMode: o.apiMode === 'control' ? 'control' : 'readonly',
+    apiPort: Number.isFinite(port) && port > 0 && port < 65536 ? Math.floor(port) : DEFAULT_PORT,
+    apiKey: typeof o.apiKey === 'string' && o.apiKey.trim() ? o.apiKey.trim() : base.apiKey,
+    apiAccessMode,
+    publicIp: typeof o.publicIp === 'string' ? o.publicIp.trim() : '',
+    domain: typeof o.domain === 'string' ? o.domain.trim() : '',
+    hskEnabled: apiAccessMode === 'sunlogin',
+    hskApiKey: typeof o.hskApiKey === 'string' ? o.hskApiKey.trim() : '',
+    hskDomain: typeof o.hskDomain === 'string' ? o.hskDomain.trim() : '',
+    hskExternalPort:
+      Number.isFinite(ext) && ext > 0 && ext < 65536 ? Math.floor(ext) : 0,
+    hskFwType: normalizeHskFwType(o.hskFwType),
+    hskMemo:
+      typeof o.hskMemo === 'string' && o.hskMemo.trim() ? o.hskMemo.trim() : HSK_DEFAULT_MEMO,
+    frpcServerAddr: typeof o.frpcServerAddr === 'string' ? o.frpcServerAddr.trim() : '',
+    frpcServerPort:
+      Number.isFinite(frpcServerPort) && frpcServerPort > 0 && frpcServerPort < 65536
+        ? Math.floor(frpcServerPort)
+        : 7000,
+    frpcToken: typeof o.frpcToken === 'string' ? o.frpcToken.trim() : '',
+    frpcType: o.frpcType === 'http' ? 'http' : 'tcp',
+    frpcRemotePort:
+      Number.isFinite(frpcRemotePort) && frpcRemotePort > 0 && frpcRemotePort < 65536
+        ? Math.floor(frpcRemotePort)
+        : DEFAULT_PORT,
+    frpcPublicHost: typeof o.frpcPublicHost === 'string' ? o.frpcPublicHost.trim() : '',
+    frpcCustomDomain: typeof o.frpcCustomDomain === 'string' ? o.frpcCustomDomain.trim() : '',
+    notifyOnError: o.notifyOnError !== false,
+    notifyOnPrintDone: o.notifyOnPrintDone !== false,
+    notifyOnIdle: Boolean(o.notifyOnIdle),
+    notifyOnLowFilament: o.notifyOnLowFilament !== false,
+    amsAutoDeduct: o.amsAutoDeduct !== false,
+    deviceRefreshSec: normalizeDeviceRefreshSec(o.deviceRefreshSec),
+    openAtLogin: Boolean(o.openAtLogin),
+    minimizeToTray: o.minimizeToTray !== false,
+    webhookEnabled: Boolean(o.webhookEnabled),
+    webhookUrl: typeof o.webhookUrl === 'string' ? o.webhookUrl.trim() : '',
+    uiTheme: normalizeUiTheme(o.uiTheme),
+    uiBgMode: normalizeUiBgMode(o.uiBgMode),
+    uiBgColor:
+      typeof o.uiBgColor === 'string' && /^#[0-9a-fA-F]{3,8}$/.test(o.uiBgColor.trim())
+        ? o.uiBgColor.trim()
+        : '#0f1115',
+    uiBgImage:
+      typeof o.uiBgImage === 'string' && o.uiBgImage.startsWith('data:image/')
+        ? o.uiBgImage.length < 2_500_000
+          ? o.uiBgImage
+          : ''
+        : ''
+  }
+}
+
+function normalizeUiTheme(v: unknown): string {
+  const s = typeof v === 'string' ? v : ''
+  if (s === 'ocean' || s === 'forest' || s === 'amber' || s === 'slate' || s === 'midnight') return s
+  return 'midnight'
+}
+
+function normalizeUiBgMode(v: unknown): string {
+  const s = typeof v === 'string' ? v : ''
+  if (s === 'color' || s === 'image' || s === 'default') return s
+  return 'default'
+}
+
+function localIpv4s(): string[] {
+  const nets = networkInterfaces()
+  const out: string[] = []
+  for (const list of Object.values(nets)) {
+    if (!list) continue
+    for (const n of list) {
+      if (n.family === 'IPv4' && !n.internal) out.push(n.address)
+    }
+  }
+  return out
+}
+
+function readJsonArray(path: string): unknown[] {
+  if (!existsSync(path)) return []
+  try {
+    const raw = JSON.parse(readFileSync(path, 'utf8'))
+    return Array.isArray(raw) ? raw : []
+  } catch {
+    return []
+  }
+}
+
+function deviceTech(d: DeviceRow): 'fdm' | 'resin' {
+  return d.tech === 'resin' ? 'resin' : 'fdm'
+}
+
+function sanitizeDevice(d: DeviceRow): Record<string, unknown> {
+  const {
+    secretKey: _s,
+    bambuUserId: _u,
+    crealityUserId: _c,
+    anycubicPrinterId: _a,
+    ...rest
+  } = d
+  return {
+    ...rest,
+    tech: deviceTech(d)
+  }
+}
+
+function sendJson(res: ServerResponse, status: number, body: unknown): void {
+  const data = JSON.stringify(body)
+  res.writeHead(status, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Content-Length': Buffer.byteLength(data),
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Headers': 'Content-Type, X-Api-Key',
+    'Access-Control-Allow-Methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS'
+  })
+  res.end(data)
+}
+
+function readBody(req: IncomingMessage): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = []
+    req.on('data', (c) => chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c)))
+    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')))
+    req.on('error', reject)
+  })
+}
+
+export type ApiServerDeps = {
+  getDevicesPath: () => string
+  getFilamentPath: () => string
+  getMonitorZonesPath: () => string
+  getSettings: () => AppSettings
+  getStatuses: () => StatusMap
+  onControl: ControlRequestHandler
+  /** Notify UI after filament file written via API */
+  onFilamentChanged?: () => void
+  /** Notify UI after monitor zones written via API */
+  onMonitorZonesChanged?: () => void
+  /** Notify UI after devices.json mutated via API */
+  onDevicesChanged?: () => void
+  listWallCameras: MonitorApiDeps['listWall']
+  listDeviceCameras: MonitorApiDeps['listDeviceCameras']
+  takeCameraSnapshot: MonitorApiDeps['takeSnapshot']
+  getDeviceApiKey: MonitorApiDeps['getDeviceApiKey']
+  setDeviceSecret: FullApiDeps['setDeviceSecret']
+  deleteDeviceSecret: FullApiDeps['deleteDeviceSecret']
+  onDeviceOp: FullApiDeps['onDeviceOp']
+  onBatchPrint: FullApiDeps['onBatchPrint']
+  startLanDiscover: FullApiDeps['startLanDiscover']
+  getLanDiscover: FullApiDeps['getLanDiscover']
+  cancelLanDiscover: FullApiDeps['cancelLanDiscover']
+  getLogs: FullApiDeps['getLogs']
+  clearLogs: FullApiDeps['clearLogs']
+  patchSettings: FullApiDeps['patchSettings']
+  version?: string
+}
+
+export class ApiServer {
+  private server: Server | null = null
+  private lastError: string | undefined
+  private readonly deps: ApiServerDeps
+  private readonly sseClients = new Set<ServerResponse>()
+  private lastWebhookAt = 0
+
+  constructor(deps: ApiServerDeps) {
+    this.deps = deps
+  }
+
+  /** 状态快照更新后：SSE 广播 + 可选 Webhook */
+  publishStatuses(statuses: StatusMap): void {
+    const payload = {
+      type: 'statuses',
+      time: new Date().toISOString(),
+      count: Object.keys(statuses).length,
+      statuses
+    }
+    this.broadcastSse('statuses', payload)
+    void this.fireWebhook(payload)
+  }
+
+  private broadcastSse(event: string, data: unknown): void {
+    if (!this.sseClients.size) return
+    const chunk = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`
+    this.sseClients.forEach((res) => {
+      try {
+        res.write(chunk)
+      } catch {
+        this.sseClients.delete(res)
+      }
+    })
+  }
+
+  private async fireWebhook(payload: unknown): Promise<void> {
+    const s = this.deps.getSettings()
+    if (!s.webhookEnabled || !s.webhookUrl) return
+    const now = Date.now()
+    // 节流：最快 2s 一次，避免机群刷爆
+    if (now - this.lastWebhookAt < 2000) return
+    this.lastWebhookAt = now
+    try {
+      await fetch(s.webhookUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Api-Key': s.apiKey || '',
+          'User-Agent': 'printer-monitor-webhook'
+        },
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(8000)
+      })
+    } catch {
+      /* ignore webhook errors */
+    }
+  }
+
+  status(): ApiStatus {
+    const s = this.deps.getSettings()
+    const running = !!this.server?.listening
+    const port = s.apiPort
+    const ips = localIpv4s()
+    const localUrls = [
+      `http://127.0.0.1:${port}`,
+      ...ips.map((ip) => `http://${ip}:${port}`)
+    ]
+    const access = resolveAccessMode(s)
+    const publicUrl =
+      access === 'local' && s.publicIp ? `http://${s.publicIp}:${port}` : null
+    const domainUrl =
+      access === 'local' && s.domain
+        ? s.domain.includes('://')
+          ? s.domain.replace(/\/$/, '')
+          : `http://${s.domain}${port === 80 ? '' : `:${port}`}`
+        : null
+    return {
+      running,
+      port,
+      mode: s.apiMode,
+      localUrls,
+      publicUrl,
+      domainUrl,
+      hskUrl: buildHskUrl(s),
+      frpcUrl: buildFrpcUrl(s),
+      error: this.lastError
+    }
+  }
+
+  async start(): Promise<ApiStatus> {
+    await this.stop()
+    const s = this.deps.getSettings()
+    this.lastError = undefined
+    return new Promise((resolve) => {
+      const server = createServer((req, res) => {
+        void this.handle(req, res)
+      })
+      server.on('error', (err) => {
+        this.lastError = err.message
+        this.server = null
+        resolve(this.status())
+      })
+      server.listen(s.apiPort, '0.0.0.0', () => {
+        this.server = server
+        resolve(this.status())
+      })
+    })
+  }
+
+  async stop(): Promise<ApiStatus> {
+    this.sseClients.forEach((res) => {
+      try {
+        res.end()
+      } catch {
+        /* ignore */
+      }
+    })
+    this.sseClients.clear()
+    const srv = this.server
+    this.server = null
+    if (!srv) return this.status()
+    await new Promise<void>((resolve) => {
+      srv.close(() => resolve())
+    })
+    return this.status()
+  }
+
+  private async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const method = (req.method || 'GET').toUpperCase()
+    if (method === 'OPTIONS') {
+      sendJson(res, 204, {})
+      return
+    }
+
+    const url = new URL(req.url || '/', 'http://127.0.0.1')
+    const path = url.pathname.replace(/\/+$/, '') || '/'
+    const settings = this.deps.getSettings()
+
+    if (path === '/api/health') {
+      sendJson(res, 200, {
+        ok: true,
+        version: this.deps.version || '0.3.0',
+        mode: settings.apiMode,
+        time: new Date().toISOString()
+      })
+      return
+    }
+
+    const key = req.headers['x-api-key']
+    if (!key || key !== settings.apiKey) {
+      sendJson(res, 401, { ok: false, message: 'Unauthorized: missing or invalid X-Api-Key' })
+      return
+    }
+
+    if (method === 'GET' && path === '/api/v1/events') {
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream; charset=utf-8',
+        'Cache-Control': 'no-cache, no-transform',
+        Connection: 'keep-alive',
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Headers': 'Content-Type, X-Api-Key'
+      })
+      res.write(`event: hello\ndata: ${JSON.stringify({ ok: true, time: new Date().toISOString() })}\n\n`)
+      this.sseClients.add(res)
+      const statuses = this.deps.getStatuses()
+      res.write(
+        `event: statuses\ndata: ${JSON.stringify({
+          type: 'statuses',
+          time: new Date().toISOString(),
+          count: Object.keys(statuses).length,
+          statuses
+        })}\n\n`
+      )
+      req.on('close', () => {
+        this.sseClients.delete(res)
+      })
+      return
+    }
+
+    try {
+      if (method === 'GET' && path === '/api/v1/summary') {
+        const devices = readJsonArray(this.deps.getDevicesPath()) as DeviceRow[]
+        const spools = readJsonArray(this.deps.getFilamentPath()) as SpoolRow[]
+        const statuses = this.deps.getStatuses()
+        const monitor = monitorSummaryCounts(this.deps.getMonitorZonesPath())
+        sendJson(res, 200, {
+          ok: true,
+          devices: {
+            total: devices.length,
+            fdm: devices.filter((d) => deviceTech(d) === 'fdm').length,
+            resin: devices.filter((d) => deviceTech(d) === 'resin').length,
+            online: devices.filter((d) => (statuses[d.id] as { health?: string } | undefined)?.health === 'online')
+              .length
+          },
+          filament: {
+            total: spools.filter((s) => !s.archived).length,
+            fdm: spools.filter((s) => s.tech === 'fdm' && !s.archived).length,
+            resin: spools.filter((s) => s.tech === 'resin' && !s.archived).length
+          },
+          monitor: {
+            zones: monitor.zones,
+            zoneCameras: monitor.cameras
+          },
+          mode: settings.apiMode
+        })
+        return
+      }
+
+      const monitorHandled = await handleMonitorApi({
+        method,
+        path,
+        url,
+        req,
+        res,
+        apiMode: settings.apiMode,
+        deps: {
+          getMonitorZonesPath: this.deps.getMonitorZonesPath,
+          onMonitorZonesChanged: this.deps.onMonitorZonesChanged,
+          listWall: this.deps.listWallCameras,
+          listDeviceCameras: this.deps.listDeviceCameras,
+          takeSnapshot: this.deps.takeCameraSnapshot,
+          getDeviceApiKey: this.deps.getDeviceApiKey
+        },
+        sendJson,
+        readBody
+      })
+      if (monitorHandled) return
+
+      const fullHandled = await handleFullApi({
+        method,
+        path,
+        url,
+        req,
+        res,
+        deps: {
+          getDevicesPath: this.deps.getDevicesPath,
+          getFilamentPath: this.deps.getFilamentPath,
+          getSettings: () => this.deps.getSettings() as unknown as Record<string, unknown> & {
+            apiMode?: string
+            apiKey?: string
+          },
+          onControl: this.deps.onControl,
+          onDevicesChanged: this.deps.onDevicesChanged,
+          setDeviceSecret: this.deps.setDeviceSecret,
+          deleteDeviceSecret: this.deps.deleteDeviceSecret,
+          onDeviceOp: this.deps.onDeviceOp,
+          onBatchPrint: this.deps.onBatchPrint,
+          startLanDiscover: this.deps.startLanDiscover,
+          getLanDiscover: this.deps.getLanDiscover,
+          cancelLanDiscover: this.deps.cancelLanDiscover,
+          getLogs: this.deps.getLogs,
+          clearLogs: this.deps.clearLogs,
+          patchSettings: this.deps.patchSettings,
+          sanitizeDevice: (d) => sanitizeDevice(d as DeviceRow),
+          onFilamentChanged: this.deps.onFilamentChanged
+        },
+        sendJson,
+        readBody
+      })
+      if (fullHandled) return
+
+      if (method === 'GET' && path === '/api/v1/devices') {
+        const tech = url.searchParams.get('tech')
+        let devices = (readJsonArray(this.deps.getDevicesPath()) as DeviceRow[]).map(sanitizeDevice)
+        if (tech === 'fdm' || tech === 'resin') {
+          devices = devices.filter((d) => d.tech === tech)
+        }
+        const statuses = this.deps.getStatuses()
+        sendJson(res, 200, {
+          ok: true,
+          devices: devices.map((d) => ({
+            ...d,
+            status: statuses[String(d.id)] || null
+          }))
+        })
+        return
+      }
+
+      const deviceMatch = path.match(/^\/api\/v1\/devices\/([^/]+)$/)
+      if (method === 'GET' && deviceMatch) {
+        const id = decodeURIComponent(deviceMatch[1])
+        const devices = readJsonArray(this.deps.getDevicesPath()) as DeviceRow[]
+        const found = devices.find((d) => d.id === id)
+        if (!found) {
+          sendJson(res, 404, { ok: false, message: 'Device not found' })
+          return
+        }
+        sendJson(res, 200, {
+          ok: true,
+          device: sanitizeDevice(found),
+          status: this.deps.getStatuses()[id] || null
+        })
+        return
+      }
+
+      const controlMatch = path.match(/^\/api\/v1\/devices\/([^/]+)\/control$/)
+      if (method === 'POST' && controlMatch) {
+        if (settings.apiMode !== 'control') {
+          sendJson(res, 403, { ok: false, message: 'API is in readonly mode' })
+          return
+        }
+        const id = decodeURIComponent(controlMatch[1])
+        const raw = await readBody(req)
+        let payload: unknown
+        try {
+          payload = raw ? JSON.parse(raw) : {}
+        } catch {
+          sendJson(res, 400, { ok: false, message: 'Invalid JSON body' })
+          return
+        }
+        if (!payload || typeof payload !== 'object') {
+          sendJson(res, 400, { ok: false, message: 'Body must be a JSON object' })
+          return
+        }
+        const body = payload as Record<string, unknown>
+        if (!isControlAction(body.action)) {
+          sendJson(res, 400, {
+            ok: false,
+            message: `Unknown or missing action. Allowed: ${DEVICE_CONTROL_ACTIONS.join(', ')}`
+          })
+          return
+        }
+        const result = await this.deps.onControl(id, {
+          action: body.action,
+          ...parseControlExtras(body)
+        })
+        sendJson(res, result.ok ? 200 : 502, result)
+        return
+      }
+
+      // 进料 / 退料专用接口（等价于 control + load_filament / unload_filament）
+      const filamentCtrl = path.match(/^\/api\/v1\/devices\/([^/]+)\/filament\/(load|unload)$/)
+      if (method === 'POST' && filamentCtrl) {
+        if (settings.apiMode !== 'control') {
+          sendJson(res, 403, { ok: false, message: 'API is in readonly mode' })
+          return
+        }
+        const id = decodeURIComponent(filamentCtrl[1])
+        const kind = filamentCtrl[2] as 'load' | 'unload'
+        const raw = await readBody(req)
+        let body: Record<string, unknown> = {}
+        if (raw) {
+          try {
+            const parsed = JSON.parse(raw) as unknown
+            if (parsed && typeof parsed === 'object') body = parsed as Record<string, unknown>
+          } catch {
+            sendJson(res, 400, { ok: false, message: 'Invalid JSON body' })
+            return
+          }
+        }
+        const extras = parseControlExtras(body)
+        const result = await this.deps.onControl(id, {
+          action: kind === 'load' ? 'load_filament' : 'unload_filament',
+          ...extras
+        })
+        sendJson(res, result.ok ? 200 : 502, result)
+        return
+      }
+
+      if (method === 'GET' && path === '/api/v1/filament') {
+        const tech = url.searchParams.get('tech')
+        const archived = url.searchParams.get('archived')
+        let spools = readJsonArray(this.deps.getFilamentPath()) as SpoolRow[]
+        if (tech === 'fdm' || tech === 'resin') {
+          spools = spools.filter((s) => s.tech === tech)
+        }
+        if (archived === '0' || archived === 'false') {
+          spools = spools.filter((s) => !s.archived)
+        } else if (archived === '1' || archived === 'true') {
+          spools = spools.filter((s) => !!s.archived)
+        }
+        sendJson(res, 200, { ok: true, spools })
+        return
+      }
+
+      const filamentOne = path.match(/^\/api\/v1\/filament\/([^/]+)$/)
+      if (filamentOne) {
+        const id = decodeURIComponent(filamentOne[1])
+        const file = this.deps.getFilamentPath()
+        const spools = readJsonArray(file) as SpoolRow[]
+        const idx = spools.findIndex((s) => s.id === id)
+
+        if (method === 'GET') {
+          if (idx < 0) {
+            sendJson(res, 404, { ok: false, message: 'Spool not found' })
+            return
+          }
+          sendJson(res, 200, { ok: true, spool: spools[idx] })
+          return
+        }
+
+        if (method === 'PUT' || method === 'PATCH' || method === 'DELETE') {
+          if (settings.apiMode !== 'control') {
+            sendJson(res, 403, { ok: false, message: 'API is in readonly mode' })
+            return
+          }
+          if (idx < 0) {
+            sendJson(res, 404, { ok: false, message: 'Spool not found' })
+            return
+          }
+          if (method === 'DELETE') {
+            spools.splice(idx, 1)
+            writeSpools(file, spools)
+            this.deps.onFilamentChanged?.()
+            sendJson(res, 200, { ok: true })
+            return
+          }
+          const raw = await readBody(req)
+          let body: Record<string, unknown>
+          try {
+            body = raw ? (JSON.parse(raw) as Record<string, unknown>) : {}
+          } catch {
+            sendJson(res, 400, { ok: false, message: 'Invalid JSON body' })
+            return
+          }
+          const next = mergeSpool(spools[idx], body, method === 'PUT')
+          if ('error' in next) {
+            sendJson(res, 400, { ok: false, message: next.error })
+            return
+          }
+          spools[idx] = next.spool
+          writeSpools(file, spools)
+          this.deps.onFilamentChanged?.()
+          sendJson(res, 200, { ok: true, spool: next.spool })
+          return
+        }
+      }
+
+      const filamentArchive = path.match(/^\/api\/v1\/filament\/([^/]+)\/archive$/)
+      if (method === 'POST' && filamentArchive) {
+        if (settings.apiMode !== 'control') {
+          sendJson(res, 403, { ok: false, message: 'API is in readonly mode' })
+          return
+        }
+        const id = decodeURIComponent(filamentArchive[1])
+        const file = this.deps.getFilamentPath()
+        const spools = readJsonArray(file) as SpoolRow[]
+        const idx = spools.findIndex((s) => s.id === id)
+        if (idx < 0) {
+          sendJson(res, 404, { ok: false, message: 'Spool not found' })
+          return
+        }
+        const raw = await readBody(req)
+        let archived = true
+        if (raw) {
+          try {
+            const body = JSON.parse(raw) as { archived?: boolean }
+            if (typeof body.archived === 'boolean') archived = body.archived
+          } catch {
+            sendJson(res, 400, { ok: false, message: 'Invalid JSON body' })
+            return
+          }
+        }
+        spools[idx] = {
+          ...spools[idx],
+          archived,
+          updatedAt: new Date().toISOString()
+        }
+        writeSpools(file, spools)
+        this.deps.onFilamentChanged?.()
+        sendJson(res, 200, { ok: true, spool: spools[idx] })
+        return
+      }
+
+      if (method === 'POST' && path === '/api/v1/filament') {
+        if (settings.apiMode !== 'control') {
+          sendJson(res, 403, { ok: false, message: 'API is in readonly mode' })
+          return
+        }
+        const raw = await readBody(req)
+        let body: Record<string, unknown>
+        try {
+          body = raw ? (JSON.parse(raw) as Record<string, unknown>) : {}
+        } catch {
+          sendJson(res, 400, { ok: false, message: 'Invalid JSON body' })
+          return
+        }
+        const created = createSpool(body)
+        if ('error' in created) {
+          sendJson(res, 400, { ok: false, message: created.error })
+          return
+        }
+        const file = this.deps.getFilamentPath()
+        const spools = readJsonArray(file) as SpoolRow[]
+        spools.unshift(created.spool)
+        writeSpools(file, spools)
+        this.deps.onFilamentChanged?.()
+        sendJson(res, 200, { ok: true, spool: created.spool })
+        return
+      }
+
+      if (method === 'GET' && path === '/api/v1/quote/presets') {
+        sendJson(res, 200, {
+          ok: true,
+          materials: QUOTE_MATERIAL_PRESETS,
+          printers: QUOTE_PRINTER_PRESETS
+        })
+        return
+      }
+
+      if (method === 'POST' && path === '/api/v1/quote/calculate') {
+        const raw = await readBody(req)
+        let body: Record<string, unknown>
+        try {
+          body = raw ? (JSON.parse(raw) as Record<string, unknown>) : {}
+        } catch {
+          sendJson(res, 400, { ok: false, message: 'Invalid JSON body' })
+          return
+        }
+        const shared = parseQuoteShared(body)
+        if ('error' in shared) {
+          sendJson(res, 400, { ok: false, message: shared.error })
+          return
+        }
+        const spools = readJsonArray(this.deps.getFilamentPath()) as SpoolRow[]
+        const optionsRaw = Array.isArray(body.options) ? body.options : null
+        if (optionsRaw && optionsRaw.length > 0) {
+          const options = optionsRaw.slice(0, 8).map((opt, i) => {
+            const o = (opt && typeof opt === 'object' ? opt : {}) as Record<string, unknown>
+            const spoolId = typeof o.spoolId === 'string' ? o.spoolId : null
+            const spool = spoolId ? spools.find((s) => s.id === spoolId) : undefined
+            let pricePerKg = Number(o.pricePerKg)
+            if ((!Number.isFinite(pricePerKg) || pricePerKg < 0) && spool) {
+              pricePerKg = spoolPricePerKg(spool) ?? 0
+            }
+            if (!Number.isFinite(pricePerKg) || pricePerKg < 0) {
+              pricePerKg = Number(body.pricePerKg) || 0
+            }
+            const costs = calcQuoteCosts({ ...shared.params, pricePerKg })
+            return {
+              id: typeof o.id === 'string' ? o.id : `opt-${i + 1}`,
+              name: typeof o.name === 'string' ? o.name : `方案 ${i + 1}`,
+              brandId: typeof o.brandId === 'string' ? o.brandId : spool?.brandId,
+              materialId: typeof o.materialId === 'string' ? o.materialId : spool?.material,
+              color: typeof o.color === 'string' ? o.color : spool?.color,
+              colorHex: typeof o.colorHex === 'string' ? o.colorHex : spool?.colorHex,
+              spoolId,
+              pricePerKg,
+              note: typeof o.note === 'string' ? o.note : undefined,
+              costs
+            }
+          })
+          sendJson(res, 200, { ok: true, shared: shared.params, options })
+          return
+        }
+        const pricePerKg = Number(body.pricePerKg) || 0
+        const costs = calcQuoteCosts({ ...shared.params, pricePerKg })
+        sendJson(res, 200, { ok: true, shared: { ...shared.params, pricePerKg }, costs })
+        return
+      }
+
+      if (method === 'POST' && path === '/api/v1/quote/parse-gcode') {
+        const raw = await readBody(req)
+        let body: { text?: string; gcode?: string }
+        try {
+          body = raw ? (JSON.parse(raw) as { text?: string; gcode?: string }) : {}
+        } catch {
+          sendJson(res, 400, { ok: false, message: 'Invalid JSON body' })
+          return
+        }
+        const text = body.text || body.gcode || ''
+        if (!text.trim()) {
+          sendJson(res, 400, { ok: false, message: 'Body must include text or gcode' })
+          return
+        }
+        sendJson(res, 200, { ok: true, ...parseGcodeMeta(text) })
+        return
+      }
+
+      sendJson(res, 404, { ok: false, message: 'Not found' })
+    } catch (err) {
+      sendJson(res, 500, {
+        ok: false,
+        message: err instanceof Error ? err.message : String(err)
+      })
+    }
+  }
+}
+
+function writeSpools(path: string, spools: SpoolRow[]): void {
+  writeFileSync(path, JSON.stringify(spools, null, 2), 'utf8')
+}
+
+function createSpool(
+  body: Record<string, unknown>
+): { spool: SpoolRow } | { error: string } {
+  const brandId = String(body.brandId || '').trim()
+  const material = String(body.material || '').trim()
+  const color = String(body.color || '').trim()
+  const colorHex = String(body.colorHex || '#888888').trim() || '#888888'
+  const tech = body.tech === 'resin' ? 'resin' : 'fdm'
+  const totalGrams = Math.max(0, Number(body.totalGrams) || 0)
+  let remainGrams = Number(body.remainGrams)
+  if (!Number.isFinite(remainGrams)) remainGrams = totalGrams
+  remainGrams = Math.max(0, Math.min(totalGrams || remainGrams, remainGrams))
+  if (!brandId) return { error: 'brandId is required' }
+  if (!material) return { error: 'material is required' }
+  if (!color) return { error: 'color is required' }
+  if (totalGrams <= 0) return { error: 'totalGrams must be > 0' }
+  const now = new Date().toISOString()
+  const rolls = normalizeRolls(body.rolls)
+  const legacyBind = normalizeAmsBinding(body.amsBinding)
+  const amsBindings = normalizeAmsBindings(
+    body.amsBindings,
+    legacyBind === undefined ? null : legacyBind,
+    rolls
+  )
+  return {
+    spool: {
+      id: randomUUID(),
+      brandId,
+      material,
+      color,
+      colorHex,
+      totalGrams,
+      remainGrams,
+      rolls,
+      location: body.location != null ? String(body.location) : undefined,
+      price: body.price != null && Number.isFinite(Number(body.price)) ? Number(body.price) : undefined,
+      openedAt: body.openedAt != null ? String(body.openedAt) : undefined,
+      notes: body.notes != null ? String(body.notes) : undefined,
+      tech,
+      archived: !!body.archived,
+      amsBindings,
+      amsBinding: amsBindings[0] || null,
+      createdAt: now,
+      updatedAt: now
+    }
+  }
+}
+
+function mergeSpool(
+  prev: SpoolRow,
+  body: Record<string, unknown>,
+  replace: boolean
+): { spool: SpoolRow } | { error: string } {
+  const base: Record<string, unknown> = replace
+    ? {
+        id: prev.id,
+        createdAt: prev.createdAt,
+        brandId: body.brandId,
+        material: body.material,
+        color: body.color,
+        colorHex: body.colorHex,
+        totalGrams: body.totalGrams,
+        remainGrams: body.remainGrams,
+        rolls: body.rolls,
+        location: body.location,
+        price: body.price,
+        openedAt: body.openedAt,
+        notes: body.notes,
+        tech: body.tech,
+        archived: body.archived,
+        amsBinding: body.amsBinding,
+        amsBindings: body.amsBindings
+      }
+    : { ...prev, ...body, id: prev.id, createdAt: prev.createdAt }
+
+  const brandId = String(base.brandId || '').trim()
+  const material = String(base.material || '').trim()
+  const color = String(base.color || '').trim()
+  const colorHex = String(base.colorHex || '#888888').trim() || '#888888'
+  const tech = base.tech === 'resin' ? 'resin' : 'fdm'
+  const totalGrams = Math.max(0, Number(base.totalGrams) || 0)
+  let remainGrams = Number(base.remainGrams)
+  if (!Number.isFinite(remainGrams)) remainGrams = totalGrams
+  remainGrams = Math.max(0, Math.min(totalGrams || remainGrams, remainGrams))
+  if (!brandId) return { error: 'brandId is required' }
+  if (!material) return { error: 'material is required' }
+  if (!color) return { error: 'color is required' }
+  if (totalGrams <= 0) return { error: 'totalGrams must be > 0' }
+
+  const rolls =
+    'rolls' in base && base.rolls != null ? normalizeRolls(base.rolls) : normalizeRolls(prev.rolls)
+
+  const legacyBind =
+    'amsBinding' in base
+      ? normalizeAmsBinding(base.amsBinding)
+      : normalizeAmsBinding(prev.amsBinding)
+  const bindingsRaw = 'amsBindings' in base ? base.amsBindings : prev.amsBindings
+  const amsBindings = normalizeAmsBindings(
+    bindingsRaw,
+    legacyBind === undefined ? null : legacyBind,
+    rolls
+  )
+
+  return {
+    spool: {
+      id: prev.id,
+      brandId,
+      material,
+      color,
+      colorHex,
+      totalGrams,
+      remainGrams,
+      rolls,
+      location: base.location != null && base.location !== '' ? String(base.location) : undefined,
+      price:
+        base.price != null && base.price !== '' && Number.isFinite(Number(base.price))
+          ? Number(base.price)
+          : undefined,
+      openedAt: base.openedAt != null && base.openedAt !== '' ? String(base.openedAt) : undefined,
+      notes: base.notes != null && base.notes !== '' ? String(base.notes) : undefined,
+      tech,
+      archived: !!base.archived,
+      amsBindings,
+      amsBinding: amsBindings[0] || null,
+      createdAt: prev.createdAt || new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    }
+  }
+}
+
+function parseQuoteShared(
+  body: Record<string, unknown>
+): { params: Omit<QuoteCalcParams, 'pricePerKg'> } | { error: string } {
+  const pricingMode: PricingMode = body.pricingMode === 'margin' ? 'margin' : 'markup'
+  const printHours =
+    body.printHours != null
+      ? Number(body.printHours)
+      : (Number(body.printHoursHours) || 0) + (Number(body.printMinutes) || 0) / 60
+  if (!Number.isFinite(printHours) || printHours < 0) {
+    return { error: 'printHours must be a non-negative number' }
+  }
+  const weightG = Number(body.weightG)
+  if (!Number.isFinite(weightG) || weightG < 0) {
+    return { error: 'weightG must be a non-negative number' }
+  }
+  return {
+    params: {
+      weightG,
+      wastePct: Number(body.wastePct) || 0,
+      watts: Number(body.watts) || 0,
+      printHours,
+      electricity: Number(body.electricity) || 0,
+      wearPerHour: Number(body.wearPerHour) || 0,
+      laborMinutes: Number(body.laborMinutes) || 0,
+      laborRate: Number(body.laborRate) || 0,
+      packaging: Number(body.packaging) || 0,
+      shipping: Number(body.shipping) || 0,
+      failPct: Number(body.failPct) || 0,
+      pricingMode,
+      markupPct: Number(body.markupPct) || 0,
+      marginPct: Number(body.marginPct) || 0,
+      minPrice: Number(body.minPrice) || 0,
+      qty: Math.max(1, Math.floor(Number(body.qty) || 1))
+    }
+  }
+}

@@ -1,0 +1,353 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1, user-scalable=no"
+    />
+    <meta name="theme-color" content="#0f1218" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <title>hanye-3D打印机监控台</title>
+    <link rel="manifest" href="manifest.webmanifest" />
+    <link rel="stylesheet" href="css/app.css" />
+  </head>
+  <body>
+    <!-- Connect gate (fullscreen) -->
+    <div class="gate" id="gate" hidden>
+      <div class="gate-inner">
+        <div class="gate-brand">hanye-3D打印机监控台</div>
+        <p class="muted gate-sub">输入电脑端 API 地址，连接后自动保存</p>
+
+        <div class="card gate-card">
+          <div class="field" id="saved-field" hidden>
+            <label for="saved-select">已保存的 API 地址</label>
+            <select id="saved-select"></select>
+          </div>
+          <div class="field">
+            <label for="conn-name">备注名（可选）</label>
+            <input id="conn-name" type="text" placeholder="例如 车间电脑" autocomplete="off" />
+          </div>
+          <div class="field-row">
+            <div class="field grow">
+              <label for="conn-host">IP / 主机名</label>
+              <input id="conn-host" type="text" placeholder="192.168.1.10" autocomplete="off" inputmode="decimal" />
+            </div>
+            <div class="field port">
+              <label for="conn-port">端口</label>
+              <input id="conn-port" type="number" value="17890" placeholder="17890" />
+            </div>
+          </div>
+          <div class="field">
+            <label for="conn-key">API Key</label>
+            <input id="conn-key" type="text" placeholder="与桌面端「API 服务」中一致" autocomplete="off" />
+          </div>
+          <div class="btn-row">
+            <button type="button" class="btn" id="btn-connect">连接并保存</button>
+            <button type="button" class="btn ghost" id="btn-test-gate">仅测试</button>
+          </div>
+          <p class="muted gate-hint">
+            请先在桌面端开启 API 服务。手机/平板需与电脑同一局域网（或使用花生壳/frpc 公网地址）。
+          </p>
+        </div>
+      </div>
+    </div>
+
+    <div class="app" id="app" hidden>
+      <header class="topbar">
+        <div class="brand">hanye-3D打印机监控台</div>
+        <nav class="top-nav">
+          <button type="button" data-page="home">首页</button>
+          <button type="button" data-page="devices">设备</button>
+          <button type="button" data-page="filament">耗材</button>
+          <button type="button" data-page="monitor">监控</button>
+          <button type="button" data-page="quote">报价</button>
+          <button type="button" data-page="settings">设置</button>
+        </nav>
+      </header>
+
+      <section class="page" data-page="home">
+        <div class="page-title">总览</div>
+        <p class="muted" id="home-mode">—</p>
+        <div class="grid-stats" id="home-stats"></div>
+        <div class="card" style="margin-top: 12px">
+          <h3>实时状态</h3>
+          <p class="muted" id="home-sse">连接事件流…</p>
+          <div id="home-live" class="live-list"></div>
+        </div>
+      </section>
+
+      <section class="page" data-page="devices">
+        <div class="page-head">
+          <div class="page-title">设备</div>
+          <button type="button" class="btn" id="btn-device-add" disabled>添加</button>
+        </div>
+        <div class="filter-row">
+          <select id="tech-filter">
+            <option value="">全部工艺</option>
+            <option value="fdm">FDM</option>
+            <option value="resin">光固化</option>
+          </select>
+        </div>
+        <div class="batch-bar card" id="batch-bar" hidden>
+          <span class="muted" id="batch-count">已选 0</span>
+          <div class="btn-row wrap">
+            <button type="button" class="btn warn sm" data-batch="pause">批量暂停</button>
+            <button type="button" class="btn sm" data-batch="resume">批量恢复</button>
+            <button type="button" class="btn danger sm" data-batch="cancel">批量取消</button>
+            <button type="button" class="btn ghost sm" id="btn-batch-print">上传打印</button>
+            <button type="button" class="btn ghost sm" id="btn-batch-clear">清空</button>
+          </div>
+          <input type="file" id="batch-file" accept=".gcode,.gco,.nc,.bgcode,.3mf" hidden />
+        </div>
+        <div class="device-grid" id="device-grid"></div>
+      </section>
+
+      <section class="page" data-page="detail">
+        <button type="button" class="btn ghost detail-back" id="btn-back-devices">← 返回设备</button>
+        <div class="page-title" id="detail-title">设备详情</div>
+        <div id="detail-body"></div>
+      </section>
+
+      <section class="page" data-page="filament">
+        <div class="page-head">
+          <div class="page-title">耗材</div>
+          <button type="button" class="btn" id="btn-filament-add">新增</button>
+        </div>
+        <div class="filter-row">
+          <select id="fil-tech">
+            <option value="">全部工艺</option>
+            <option value="fdm">FDM</option>
+            <option value="resin">光固化</option>
+          </select>
+          <select id="fil-archived">
+            <option value="0">未归档</option>
+            <option value="1">已归档</option>
+            <option value="">全部</option>
+          </select>
+        </div>
+        <div id="filament-list"></div>
+      </section>
+
+      <section class="page" data-page="monitor">
+        <div class="page-head">
+          <div class="page-title">监控</div>
+          <button type="button" class="btn" id="btn-zone-add">新建区域</button>
+        </div>
+        <div id="monitor-list"></div>
+      </section>
+
+      <section class="page" data-page="quote">
+        <div class="page-title">代打报价</div>
+        <div class="quote-layout">
+          <div class="card quote-form" id="quote-form"></div>
+          <div class="card quote-result" id="quote-result">
+            <p class="muted">填写左侧参数后点击计算</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="page" data-page="settings">
+        <div class="page-title">设置</div>
+        <div class="card">
+          <h3>当前连接</h3>
+          <p class="muted" id="settings-current">—</p>
+          <div class="field">
+            <label for="settings-saved">切换已保存地址</label>
+            <select id="settings-saved"></select>
+          </div>
+          <div class="btn-row">
+            <button type="button" class="btn" id="btn-use-saved">切换并连接</button>
+            <button type="button" class="btn ghost" id="btn-edit-conn">修改当前</button>
+            <button type="button" class="btn danger" id="btn-del-saved">删除选中</button>
+          </div>
+        </div>
+        <div class="card">
+          <h3>添加 / 更换服务器</h3>
+          <div class="field-row">
+            <div class="field grow">
+              <label for="set-host">IP / 主机名</label>
+              <input id="set-host" type="text" placeholder="192.168.1.10" />
+            </div>
+            <div class="field port">
+              <label for="set-port">端口</label>
+              <input id="set-port" type="number" value="17890" />
+            </div>
+          </div>
+          <div class="field">
+            <label for="set-key">API Key</label>
+            <input id="set-key" type="text" />
+          </div>
+          <div class="field">
+            <label for="set-name">备注名</label>
+            <input id="set-name" type="text" placeholder="可选" />
+          </div>
+          <div class="btn-row">
+            <button type="button" class="btn" id="btn-save-set">保存并连接</button>
+            <button type="button" class="btn ghost" id="btn-disconnect">断开连接</button>
+          </div>
+          <p class="muted" id="settings-mode" style="margin-top: 12px"></p>
+        </div>
+        <div class="card" id="remote-settings-card">
+          <h3>远程设置（完整 API）</h3>
+          <p class="muted" id="remote-settings-hint">连接后加载桌面端设置</p>
+          <div class="field-row">
+            <label class="check"><input type="checkbox" id="rs-notify-error" /> 异常通知</label>
+            <label class="check"><input type="checkbox" id="rs-notify-done" /> 打印完成通知</label>
+          </div>
+          <div class="field-row">
+            <label class="check"><input type="checkbox" id="rs-ams-deduct" /> AMS 自动扣减</label>
+            <label class="check"><input type="checkbox" id="rs-webhook" /> Webhook</label>
+          </div>
+          <div class="field">
+            <label>Webhook URL</label>
+            <input id="rs-webhook-url" type="text" placeholder="https://…" />
+          </div>
+          <div class="field">
+            <label>刷新间隔（秒）</label>
+            <input id="rs-refresh" type="number" min="1" max="60" value="3" />
+          </div>
+          <div class="btn-row">
+            <button type="button" class="btn" id="btn-remote-save" disabled>保存远程设置</button>
+            <button type="button" class="btn ghost" id="btn-discover">局域网发现</button>
+          </div>
+          <p class="muted" id="discover-status"></p>
+        </div>
+        <div class="card">
+          <div class="page-head" style="margin-bottom: 8px">
+            <h3 style="margin:0">操作日志</h3>
+            <button type="button" class="btn danger sm" id="btn-logs-clear" disabled>清空</button>
+          </div>
+          <div id="logs-list" class="logs-list muted">连接后加载</div>
+        </div>
+      </section>
+
+      <nav class="bottom-nav">
+        <button type="button" data-page="home"><span class="ico">⌂</span>首页</button>
+        <button type="button" data-page="devices"><span class="ico">▣</span>设备</button>
+        <button type="button" data-page="filament"><span class="ico">◈</span>耗材</button>
+        <button type="button" data-page="monitor"><span class="ico">◉</span>监控</button>
+        <button type="button" data-page="quote"><span class="ico">¥</span>报价</button>
+        <button type="button" data-page="settings"><span class="ico">⚙</span>设置</button>
+      </nav>
+    </div>
+
+    <!-- Filament modal -->
+    <div class="modal" id="fil-modal" hidden>
+      <div class="modal-card">
+        <div class="page-title" id="fil-modal-title">耗材</div>
+        <input type="hidden" id="fil-id" />
+        <div class="field">
+          <label>品牌 ID</label>
+          <input id="fil-brand" type="text" placeholder="bambu / elegoo …" />
+        </div>
+        <div class="field">
+          <label>材料</label>
+          <input id="fil-material" type="text" placeholder="PLA" />
+        </div>
+        <div class="field-row">
+          <div class="field grow">
+            <label>颜色名</label>
+            <input id="fil-color" type="text" placeholder="红" />
+          </div>
+          <div class="field port">
+            <label>色值</label>
+            <input id="fil-hex" type="color" value="#888888" />
+          </div>
+        </div>
+        <div class="field-row">
+          <div class="field grow">
+            <label>总量 / 单卷 g</label>
+            <input id="fil-total" type="number" />
+          </div>
+          <div class="field grow">
+            <label>余量 g</label>
+            <input id="fil-remain" type="number" />
+          </div>
+          <div class="field port">
+            <label>卷数</label>
+            <input id="fil-rolls" type="number" min="1" max="99" value="1" />
+          </div>
+        </div>
+        <div class="field">
+          <label>工艺</label>
+          <select id="fil-tech-edit">
+            <option value="fdm">FDM</option>
+            <option value="resin">光固化</option>
+          </select>
+        </div>
+        <div class="field" id="fil-bind-wrap">
+          <label>绑定设备（可选）</label>
+          <select id="fil-bind-device"><option value="">不绑定</option></select>
+          <div class="field-row" style="margin-top:8px">
+            <div class="field grow">
+              <label>槽位（0=外挂）</label>
+              <input id="fil-bind-slot" type="number" min="0" value="0" />
+            </div>
+          </div>
+        </div>
+        <div class="field">
+          <label>位置 / 备注</label>
+          <input id="fil-notes" type="text" />
+        </div>
+        <div class="btn-row">
+          <button type="button" class="btn" id="fil-save">保存</button>
+          <button type="button" class="btn ghost" id="fil-cancel">取消</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Device add modal -->
+    <div class="modal" id="dev-modal" hidden>
+      <div class="modal-card">
+        <div class="page-title">添加设备</div>
+        <div class="field">
+          <label>名称</label>
+          <input id="dev-name" type="text" placeholder="P1" />
+        </div>
+        <div class="field">
+          <label>品牌</label>
+          <select id="dev-brand">
+            <option value="klipper">Klipper / Moonraker</option>
+            <option value="bambu">Bambu</option>
+            <option value="creality">Creality</option>
+            <option value="qidi">Qidi</option>
+            <option value="elegoo">Elegoo</option>
+            <option value="anycubic">Anycubic</option>
+            <option value="snapmaker">Snapmaker</option>
+            <option value="flashforge">Flashforge</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>工艺</label>
+          <select id="dev-tech">
+            <option value="fdm">FDM</option>
+            <option value="resin">光固化</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>Base URL（Moonraker）</label>
+          <input id="dev-base" type="text" placeholder="http://192.168.1.10:7125" />
+        </div>
+        <div class="field">
+          <label>Bambu 主机 IP</label>
+          <input id="dev-bambu-host" type="text" placeholder="192.168.1.20" />
+        </div>
+        <div class="field">
+          <label>密钥 / 访问码</label>
+          <input id="dev-secret" type="text" placeholder="可选" />
+        </div>
+        <div class="btn-row">
+          <button type="button" class="btn" id="dev-save">保存</button>
+          <button type="button" class="btn ghost" id="dev-cancel">取消</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="toast" id="toast"></div>
+
+    <script src="js/api.js"></script>
+    <script src="js/app.js"></script>
+  </body>
+</html>

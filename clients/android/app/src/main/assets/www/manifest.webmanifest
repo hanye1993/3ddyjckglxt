@@ -1,0 +1,10 @@
+{
+  "name": "hanye-3D打印机监控台",
+  "short_name": "打印机监控",
+  "description": "手机/平板配套客户端",
+  "start_url": "./index.html",
+  "display": "standalone",
+  "background_color": "#0f1218",
+  "theme_color": "#0f1218",
+  "lang": "zh-CN"
+}
