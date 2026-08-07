@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { Typography } from 'antd'
 import type { CameraSource } from '../../adapters/base'
+import { serverGet } from '../../api/serverClient'
 
 function remoteOf(c: CameraSource): string {
   return c.remoteSnapshotUrl || c.remoteStreamUrl || c.snapshotUrl || c.streamUrl || ''
@@ -55,16 +56,34 @@ export function SnapshotCam({
         return
       }
       try {
-        const res = await window.electronAPI?.camera?.snapshot({ url: remote })
-        if (res?.ok && res.base64) {
-          failRef.current = 0
-          aliveRef.current = true
-          setPhase('live')
-          setErr('')
-          setImgSrc(`data:${res.contentType || 'image/jpeg'};base64,${res.base64}`)
-          return
+        if (remote.startsWith('server-api:')) {
+          const path = remote.slice('server-api:'.length)
+          const data = await serverGet<{
+            contentType?: string
+            base64?: string
+            message?: string
+          }>(path)
+          if (data.base64) {
+            failRef.current = 0
+            aliveRef.current = true
+            setPhase('live')
+            setErr('')
+            setImgSrc(`data:${data.contentType || 'image/jpeg'};base64,${data.base64}`)
+            return
+          }
+          if (data.message) setErr(data.message)
+        } else {
+          const res = await window.electronAPI?.camera?.snapshot({ url: remote })
+          if (res?.ok && res.base64) {
+            failRef.current = 0
+            aliveRef.current = true
+            setPhase('live')
+            setErr('')
+            setImgSrc(`data:${res.contentType || 'image/jpeg'};base64,${res.base64}`)
+            return
+          }
+          if (res && 'message' in res && res.message) setErr(res.message)
         }
-        if (res && 'message' in res && res.message) setErr(res.message)
       } catch {
         /* ignore */
       }
@@ -82,6 +101,7 @@ export function SnapshotCam({
       }
     }
   }, [cameras, intervalMs, active])
+
 
   return (
     <div className="monitor-tile">

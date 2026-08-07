@@ -1,5 +1,6 @@
 import { randomUUID } from 'crypto'
 import { existsSync, readFileSync, writeFileSync } from 'fs'
+import { normalizeSsoSettings, publicSsoSettings } from '../../shared/sso'
 
 const BRANDS = new Set([
   'klipper',
@@ -255,6 +256,7 @@ export function publicSettings(settings: Record<string, unknown>): Record<string
     hskApiKey: _h,
     apiKey: _k,
     uiBgImage: _img,
+    sso: rawSso,
     ...rest
   } = settings
   return {
@@ -262,7 +264,8 @@ export function publicSettings(settings: Record<string, unknown>): Record<string
     apiKeySet: !!apiKey,
     apiKeyMasked: maskApiKey(apiKey),
     frpcTokenSet: !!(typeof settings.frpcToken === 'string' && settings.frpcToken),
-    hskApiKeySet: !!(typeof settings.hskApiKey === 'string' && settings.hskApiKey)
+    hskApiKeySet: !!(typeof settings.hskApiKey === 'string' && settings.hskApiKey),
+    sso: publicSsoSettings(normalizeSsoSettings(rawSso))
   }
 }
 
@@ -284,5 +287,6 @@ export const SETTINGS_PATCH_KEYS = [
   'webhookEnabled',
   'webhookUrl',
   'openAtLogin',
-  'minimizeToTray'
+  'minimizeToTray',
+  'sso'
 ] as const

@@ -1,4 +1,10 @@
 import { create } from 'zustand'
+import { isClientMode, serverGet, serverSend } from '../api/serverClient'
+import {
+  defaultSsoSettings,
+  normalizeSsoSettings,
+  type SsoSettingsBundle
+} from '@shared/sso'
 
 export type ApiMode = 'readonly' | 'control'
 export type ApiAccessMode = 'local' | 'sunlogin' | 'frpc'
@@ -23,11 +29,14 @@ export type AppSettings = {
   hskMemo: string
   frpcServerAddr: string
   frpcServerPort: number
+  frpcUser: string
   frpcToken: string
+  frpcProxyName: string
   frpcType: FrpcProxyType
   frpcRemotePort: number
   frpcPublicHost: string
   frpcCustomDomain: string
+  frpcTlsEnable: boolean
   notifyOnError: boolean
   notifyOnPrintDone: boolean
   notifyOnIdle: boolean
@@ -44,6 +53,7 @@ export type AppSettings = {
   uiBgMode: UiBgMode
   uiBgColor: string
   uiBgImage: string
+  sso: SsoSettingsBundle
 }
 
 export function normalizeDeviceRefreshSec(v: unknown): number {
@@ -106,11 +116,14 @@ const defaults: AppSettings = {
   hskMemo: HSK_DEFAULT_MEMO,
   frpcServerAddr: '',
   frpcServerPort: 7000,
+  frpcUser: '',
   frpcToken: '',
+  frpcProxyName: '',
   frpcType: 'tcp',
   frpcRemotePort: 17890,
   frpcPublicHost: '',
   frpcCustomDomain: '',
+  frpcTlsEnable: false,
   notifyOnError: true,
   notifyOnPrintDone: true,
   notifyOnIdle: false,
@@ -124,7 +137,8 @@ const defaults: AppSettings = {
   uiTheme: 'midnight',
   uiBgMode: 'default',
   uiBgColor: '#0f1115',
-  uiBgImage: ''
+  uiBgImage: '',
+  sso: defaultSsoSettings()
 }
 
 function normalizeUiTheme(v: unknown): UiThemeId {
@@ -164,11 +178,14 @@ function mapSettings(raw: Record<string, unknown> | Partial<AppSettings> | null 
     hskMemo: (typeof r.hskMemo === 'string' && r.hskMemo) || HSK_DEFAULT_MEMO,
     frpcServerAddr: (typeof r.frpcServerAddr === 'string' && r.frpcServerAddr) || '',
     frpcServerPort: Number(r.frpcServerPort) || 7000,
+    frpcUser: (typeof r.frpcUser === 'string' && r.frpcUser) || '',
     frpcToken: (typeof r.frpcToken === 'string' && r.frpcToken) || '',
+    frpcProxyName: (typeof r.frpcProxyName === 'string' && r.frpcProxyName) || '',
     frpcType: r.frpcType === 'http' ? 'http' : 'tcp',
     frpcRemotePort: Number(r.frpcRemotePort) || 17890,
     frpcPublicHost: (typeof r.frpcPublicHost === 'string' && r.frpcPublicHost) || '',
     frpcCustomDomain: (typeof r.frpcCustomDomain === 'string' && r.frpcCustomDomain) || '',
+    frpcTlsEnable: r.frpcTlsEnable === true,
     notifyOnError: r.notifyOnError !== false,
     notifyOnPrintDone: r.notifyOnPrintDone !== false,
     notifyOnIdle: Boolean(r.notifyOnIdle),
@@ -188,7 +205,22 @@ function mapSettings(raw: Record<string, unknown> | Partial<AppSettings> | null 
     uiBgImage:
       typeof r.uiBgImage === 'string' && r.uiBgImage.startsWith('data:image/')
         ? r.uiBgImage
-        : ''
+        : '',
+    sso: (() => {
+      const next = normalizeSsoSettings(r.sso)
+      // Public settings strip secrets; keep empty secrets (server disk load has real ones)
+      const pub = r.sso as
+        | {
+            wecom?: { secretSet?: boolean; secret?: string }
+            dingtalk?: { appSecretSet?: boolean; appSecret?: string }
+            ad?: { bindPasswordSet?: boolean; bindPassword?: string }
+          }
+        | undefined
+      if (pub?.wecom?.secretSet && !next.wecom.secret) next.wecom.secret = ''
+      if (pub?.dingtalk?.appSecretSet && !next.dingtalk.appSecret) next.dingtalk.appSecret = ''
+      if (pub?.ad?.bindPasswordSet && !next.ad.bindPassword) next.ad.bindPassword = ''
+      return next
+    })()
   }
 }
 
@@ -201,6 +233,7 @@ type SettingsState = {
   hskDomains: HskDomainItem[]
   hskMappings: HskMapping[]
   init: () => Promise<void>
+  refreshFromServer: (opts?: { silent?: boolean }) => Promise<void>
   refreshStatus: () => Promise<void>
   patchLocal: (partial: Partial<AppSettings>) => void
   setAccessMode: (mode: ApiAccessMode) => void
@@ -225,7 +258,18 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
 
   init: async () => {
     set({ loading: true })
-    const raw = await window.electronAPI?.settings?.load()
+    let raw: Record<string, unknown> | null = null
+    if (isClientMode()) {
+      try {
+        const data = await serverGet<{ settings?: Record<string, unknown> }>('/api/v1/settings')
+        raw = (data.settings || null) as Record<string, unknown> | null
+      } catch (e) {
+        console.error(e)
+        raw = null
+      }
+    } else {
+      raw = (await window.electronAPI?.settings?.load()) as Record<string, unknown> | null
+    }
     let settings = mapSettings(raw as Record<string, unknown>)
     try {
       const cached = localStorage.getItem('pm:appearance')
@@ -255,11 +299,37 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
     } catch {
       /* ignore */
     }
-    const status = (await window.electronAPI?.api?.status()) || null
+    const status = isClientMode()
+      ? null
+      : (await window.electronAPI?.api?.status()) || null
     set({ settings, status, loading: false })
   },
 
+  refreshFromServer: async (opts?: { silent?: boolean }) => {
+    if (!isClientMode()) return
+    const silent = Boolean(opts?.silent)
+    if (!silent) set({ loading: true })
+    try {
+      const data = await serverGet<{ settings?: Record<string, unknown> }>('/api/v1/settings')
+      const raw = (data.settings || null) as Record<string, unknown> | null
+      const settings = mapSettings(raw as Record<string, unknown>)
+      const prev = get().settings
+      if (JSON.stringify(prev) === JSON.stringify(settings)) {
+        if (!silent) set({ loading: false })
+        return
+      }
+      set({ settings, loading: false })
+    } catch (e) {
+      console.error(e)
+      if (!silent) set({ loading: false })
+    }
+  },
+
   refreshStatus: async () => {
+    if (isClientMode()) {
+      set({ status: null })
+      return
+    }
     const status = (await window.electronAPI?.api?.status()) || null
     set({ status })
   },
@@ -282,10 +352,8 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
     set({ saving: true })
     const next = { ...get().settings, ...partial }
     next.hskEnabled = next.apiAccessMode === 'sunlogin'
-    const res = await window.electronAPI?.settings?.save(next)
-    if (res) {
-      const mapped = mapSettings(res.settings as Record<string, unknown>)
-      // 外观/偏好以本次提交为准，防止旧主进程 normalize 丢字段导致 UI 闪回默认
+
+    const applyMerged = (mapped: AppSettings, status: ApiStatus | null) => {
       const merged = {
         ...mapped,
         openAtLogin: next.openAtLogin,
@@ -299,7 +367,8 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
         uiTheme: next.uiTheme,
         uiBgMode: next.uiBgMode,
         uiBgColor: next.uiBgColor,
-        uiBgImage: next.uiBgImage
+        uiBgImage: next.uiBgImage,
+        sso: next.sso
       }
       try {
         localStorage.setItem(
@@ -314,11 +383,47 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
       } catch {
         /* ignore quota */
       }
-      set({
-        settings: merged,
-        status: res.status as ApiStatus,
-        saving: false
-      })
+      set({ settings: merged, status, saving: false })
+    }
+
+    if (isClientMode()) {
+      try {
+        const patch: Record<string, unknown> = {}
+        const keys = [
+          'notifyOnError',
+          'notifyOnPrintDone',
+          'notifyOnIdle',
+          'notifyOnLowFilament',
+          'amsAutoDeduct',
+          'deviceRefreshSec',
+          'webhookEnabled',
+          'webhookUrl',
+          'openAtLogin',
+          'minimizeToTray'
+        ] as const
+        for (const key of keys) {
+          if (partial && key in partial) patch[key] = next[key]
+        }
+        if (Object.keys(patch).length) {
+          const data = await serverSend<{ settings?: Record<string, unknown> }>(
+            '/api/v1/settings',
+            'PATCH',
+            patch
+          )
+          applyMerged(mapSettings(data.settings as Record<string, unknown>), null)
+        } else {
+          applyMerged(next, null)
+        }
+      } catch (e) {
+        console.error(e)
+        set({ saving: false })
+      }
+      return
+    }
+
+    const res = await window.electronAPI?.settings?.save(next)
+    if (res) {
+      applyMerged(mapSettings(res.settings as Record<string, unknown>), res.status as ApiStatus)
     } else {
       set({ saving: false })
     }

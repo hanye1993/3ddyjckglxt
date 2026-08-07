@@ -5,6 +5,7 @@ node_modules/
 dist/
 out/
 release/
+release-server/
 *.tsbuildinfo
 
 # Logs & env

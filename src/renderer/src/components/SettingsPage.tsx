@@ -333,10 +333,17 @@ export function SettingsPage() {
               message="Frpc 内网穿透"
               description={
                 <div className="settings-hsk-steps">
-                  <div>1. 自备 frps 服务端，本机运行 frpc 客户端</div>
-                  <div>2. 填写下方参数并保存，导出或复制 frpc.toml</div>
+                  <div>1. 自建 frps，或使用 DPFRP 等面板下发的官方配置</div>
+                  <div>2. 按官方 toml 填写下方字段（字段与官方配置一一对应）后保存</div>
                   <div>
-                    3. 执行 <code>frpc -c frpc.toml</code>，将流量转到 127.0.0.1:{settings.apiPort}
+                    3. 导出 toml 后执行 <code>frpc -c frpc.toml</code>，转到 127.0.0.1:
+                    {settings.apiPort}
+                  </div>
+                  <div style={{ marginTop: 6 }}>
+                    对照示例：<code>serverAddr</code>→服务器地址，<code>serverPort</code>→端口，
+                    <code>user</code>→用户，<code>auth.token</code>→Token，
+                    <code>[[proxies]].name</code>→隧道名称，<code>remotePort</code>→远程端口，
+                    解析域名填「外网访问主机」
                   </div>
                   <Space wrap style={{ marginTop: 8 }}>
                     <Button
@@ -352,9 +359,9 @@ export function SettingsPage() {
             />
 
             <div className="settings-field">
-              <Typography.Text strong>frps 服务器地址</Typography.Text>
+              <Typography.Text strong>服务器地址（serverAddr）</Typography.Text>
               <Input
-                placeholder="例如 frp.example.com"
+                placeholder="例如 sc1.dpfrp.top"
                 value={settings.frpcServerAddr}
                 onChange={(e) => patchLocal({ frpcServerAddr: e.target.value })}
                 style={{ maxWidth: 360 }}
@@ -362,7 +369,7 @@ export function SettingsPage() {
             </div>
 
             <div className="settings-field">
-              <Typography.Text strong>frps 端口</Typography.Text>
+              <Typography.Text strong>服务器端口（serverPort）</Typography.Text>
               <InputNumber
                 min={1}
                 max={65535}
@@ -370,15 +377,36 @@ export function SettingsPage() {
                 onChange={(v) => patchLocal({ frpcServerPort: Number(v || 7000) })}
                 style={{ width: 160 }}
               />
+              <Typography.Text type="secondary">面板常见 1000；自建 frps 常见 7000</Typography.Text>
             </div>
 
             <div className="settings-field">
-              <Typography.Text strong>Token（选填）</Typography.Text>
+              <Typography.Text strong>用户（user）</Typography.Text>
+              <Input
+                placeholder="例如 dpfrp1786022515（自建可留空）"
+                value={settings.frpcUser}
+                onChange={(e) => patchLocal({ frpcUser: e.target.value })}
+                style={{ maxWidth: 360 }}
+              />
+            </div>
+
+            <div className="settings-field">
+              <Typography.Text strong>Token（auth.token）</Typography.Text>
               <Input.Password
-                placeholder="与 frps 配置一致"
+                placeholder="与官方配置 / frps 一致"
                 value={settings.frpcToken}
                 onChange={(e) => patchLocal({ frpcToken: e.target.value })}
                 style={{ maxWidth: 420 }}
+              />
+            </div>
+
+            <div className="settings-field">
+              <Typography.Text strong>隧道名称（proxies.name）</Typography.Text>
+              <Input
+                placeholder="例如 1786025437（须与面板一致）"
+                value={settings.frpcProxyName}
+                onChange={(e) => patchLocal({ frpcProxyName: e.target.value })}
+                style={{ maxWidth: 360 }}
               />
             </div>
 
@@ -398,7 +426,7 @@ export function SettingsPage() {
 
             {settings.frpcType === 'tcp' ? (
               <div className="settings-field">
-                <Typography.Text strong>远程端口</Typography.Text>
+                <Typography.Text strong>远程端口（remotePort）</Typography.Text>
                 <InputNumber
                   min={1}
                   max={65535}
@@ -406,7 +434,9 @@ export function SettingsPage() {
                   onChange={(v) => patchLocal({ frpcRemotePort: Number(v || settings.apiPort) })}
                   style={{ width: 160 }}
                 />
-                <Typography.Text type="secondary">外网访问端口（映射到本机 API 端口）</Typography.Text>
+                <Typography.Text type="secondary">
+                  外网端口；本地仍映射到 API 端口 {settings.apiPort}
+                </Typography.Text>
               </div>
             ) : (
               <div className="settings-field">
@@ -425,12 +455,26 @@ export function SettingsPage() {
               <Input
                 placeholder={
                   settings.frpcType === 'tcp'
-                    ? 'frps 公网 IP 或域名，用于拼访问地址'
+                    ? '解析地址，如 sc1.dpfrp.top（用于拼访问 URL）'
                     : '可选，未填自定义域名时使用'
                 }
                 value={settings.frpcPublicHost}
                 onChange={(e) => patchLocal({ frpcPublicHost: e.target.value })}
                 style={{ maxWidth: 420 }}
+              />
+            </div>
+
+            <div className="settings-field">
+              <Typography.Text strong>TLS（transport.tls.enable）</Typography.Text>
+              <Radio.Group
+                value={settings.frpcTlsEnable ? 'on' : 'off'}
+                onChange={(e) => patchLocal({ frpcTlsEnable: e.target.value === 'on' })}
+                optionType="button"
+                buttonStyle="solid"
+                options={[
+                  { value: 'off', label: '关闭（面板常用）' },
+                  { value: 'on', label: '开启' }
+                ]}
               />
             </div>
 

@@ -1,102 +1,148 @@
 # hanye · 3D 打印机监控台
 
-Windows 桌面应用：统一监控与控制多品牌 FDM / 光固化 3D 打印机，并提供局域网 HTTP API，供浏览器、Android、PHP 等客户端远程调用。
+Windows 桌面端统一监控与控制多品牌 FDM / 光固化 3D 打印机，并提供局域网 HTTP API。支持 **服务端 / 客户端** 分角色部署、用户权限、按设备授权、打印队列审核，以及浏览器 / Android / PHP 远程访问。
 
-当前版本：**0.3.0** · 许可证：[MIT](LICENSE)
+**仓库：** [https://github.com/hanye1993/3ddyjckglxt](https://github.com/hanye1993/3ddyjckglxt)  
+**版本：** 0.3.0 · **许可：** MIT
 
-## 功能
+---
 
-- 多品牌设备接入（密钥使用 Electron `safeStorage` 加密存储）
-- 实时状态：温度、进度、剩余时间、在线状态；支持 FDM / 树脂分区
-- 远程控制：暂停 / 恢复 / 取消 / 急停 / 归零、设温、风扇、速度、进退料、打印文件
-- 批量暂停 / 恢复 / 取消，以及批量上传打印
-- 耗材管理：料卷、卷数、AMS / 外挂槽位绑定、自动扣减、归档
-- 监控墙：舱内摄像头 + 自定义区域 HTTP / MJPEG 摄像头与抓帧
-- 代打报价：解析 G-code 克重与时长，成本计算，导出 Excel
-- 局域网完整 HTTP API（只读 / 可控制），支持 SSE 推送与 Webhook
-- 外网接入：花生壳（向日葵映射）或 frpc
+## 目录
 
-> 说明：云端账号登录（如拓竹、创想短信登录）仅桌面端可用；文件上传与批量打印需保持桌面主窗口运行。
+- [功能概览](#功能概览)
+- [服务端与客户端](#服务端与客户端)
+- [支持品牌](#支持品牌)
+- [环境要求](#环境要求)
+- [安装与运行](#安装与运行)
+- [用户权限与按设备授权](#用户权限与按设备授权)
+- [打印队列与审核](#打印队列与审核)
+- [开启 API 服务](#开启-api-服务)
+- [其它客户端](#其它客户端)
+- [配置与安全](#配置与安全)
+- [项目结构](#项目结构)
+
+---
+
+## 功能概览
+
+| 模块 | 能力 |
+|------|------|
+| 设备管理 | 添加 / 编辑 / 删除；品牌筛选；局域网发现；操作日志 |
+| 实时监控 | 温度、进度、剩余时间、在线状态；FDM / 树脂分区；客户端按刷新周期同步 |
+| 远程控制 | 暂停 / 恢复 / 取消 / 急停 / 归零；设温、风扇、速度；进退料 |
+| 批量操作 | 批量暂停 / 恢复 / 取消；批量上传并打印（Moonraker 类） |
+| 耗材 | 料卷管理、AMS / 外挂绑定、自动扣减；客户端自动同步服务端变更 |
+| 打印队列 | 客户端提交 `.gcode` → 按权限审核或直入队 → 管理员确认床清空后开打 |
+| 权限 | 全局导航 / 耗材 / 审核；**打印机操作仅在「按设备授权」中勾选** |
+| 监控墙 | 舱内摄像头；自定义区域 HTTP / MJPEG |
+| 代打报价 | G-code 解析克重与时长；Excel 导出 |
+| HTTP API | 只读 / 可控制；SSE；Webhook；花生壳 / frpc |
+
+---
+
+## 服务端与客户端
+
+| 角色 | 说明 |
+|------|------|
+| **服务端** | 公司 Windows 机：连接全部打印机、本机管理台、用户与队列、默认开启 API（端口 **17890**） |
+| **客户端** | 员工电脑：登录服务端后拉数据与状态；**不托管 API**；仅显示有权限的设备与操作 |
+
+```bash
+npm run dev:server   # 开发 · 服务端
+npm run dev:client   # 开发 · 客户端
+npm run dist:server  # 打包服务端安装包 → release/ 或 release-server/
+npm run dist:client  # 打包客户端安装包 → release/
+```
+
+默认管理员：`admin` / `admin123`（请立刻修改）。
+
+---
 
 ## 支持品牌
 
-| 品牌 | 连接方式 |
-|------|----------|
+| 品牌 | 协议 / 模式 |
+|------|-------------|
 | Klipper / 奇迪 / 创想局域网 | Moonraker HTTP + WebSocket |
 | 拓竹 Bambu Lab | MQTT + 局域网摄像头；云端登录（仅桌面） |
-| 创想 Creality | 局域网 WebSocket + 云端 |
+| 创想 Creality | 局域网原生 WS + 云端 |
 | 电光 Elegoo | SDCP |
 | 纵维 Anycubic | 局域网 + 云端 |
-| Snapmaker | 局域网 |
-| 闪铸 FlashForge | 局域网 |
+| Snapmaker / 闪铸 | 局域网 |
 
-设备字段 `brand` 取值：`klipper`、`bambu`、`creality`、`elegoo`、`anycubic`、`snapmaker`、`flashforge`、`qidi`。
+`brand` 字段：`klipper`、`bambu`、`creality`、`elegoo`、`anycubic`、`snapmaker`、`flashforge`、`qidi`。
+
+---
 
 ## 环境要求
 
-- Windows 10 / 11
-- Node.js 20+（开发与打包）
-- Android 客户端另需：Android Studio、JDK 17、Android 7.0+（API 24）
+- Node.js 20+ / npm  
+- Windows 10 / 11  
+- Android 客户端另需：Android Studio、JDK 17、API 24+
 
-## 快速开始
+---
+
+## 安装与运行
 
 ```bash
-git clone https://github.com/hanye1993/hanye3Dprintergroup-control.git
-cd hanye3Dprintergroup-control
+git clone https://github.com/hanye1993/3ddyjckglxt.git
+cd 3ddyjckglxt
 npm install
-npm run dev
+npm run dev:server    # 或 npm run dev:client
 ```
 
-### 打包 Windows 安装包
-
-```bash
-npm run dist
-```
-
-产物输出到 `release/`（该目录已加入 `.gitignore`，不会提交到仓库）。
-
-常用脚本：
+### 常用脚本
 
 | 命令 | 说明 |
 |------|------|
-| `npm run dev` | 开发模式 |
-| `npm run build` | 仅编译 |
-| `npm run dist` | 编译并打包 |
-| `npm run sync:android` | 同步 Web 资源到 Android |
+| `npm run build` | 编译主进程 / 渲染进程 |
+| `npm run dist` | 通用 Windows 包 |
+| `npm run dist:server` / `dist:client` | 分角色安装包 |
+| `npm run sync:android` | 同步 Web 到 Android 资源 |
 | `npm run typecheck` | TypeScript 检查 |
 
-## 桌面端使用
+---
 
-1. 启动后在侧栏进入 FDM / 光固化设备页，手动添加或局域网发现打印机。
-2. **耗材**：管理料卷并绑定 AMS / 外挂槽位，可开启自动扣减。
-3. **监控**：查看舱内摄像头，或配置区域摄像头。
-4. **工具**：代打报价与 Excel 导出。
-5. **设置**：主题、数据目录、开机启动、托盘、通知、Webhook、API 服务等。
+## 用户权限与按设备授权
 
-应用数据默认保存在 Electron `userData`，可在设置中更改数据目录。常见文件：`devices.json`、`filament-spools.json`、`monitor-zones.json`、`app-settings.json`、`operation-logs.jsonl`、`secrets.bin`。
+服务端侧栏 **用户权限**：
 
-## 开启 API
+1. **全局权限**：导航、设备增删、耗材、审核等（**不含** 暂停/归零等机台操作）。
+2. **按设备授权**：开启某台打印机后，该用户只能看到已开启设备；暂停、归零、急停、进料、上传等 **只在该设备下勾选**。
+3. **仅「查看」**：只能看到设备卡片，**不能点进控制面板**；需至少再勾一项操作权限才能进入控制页。
 
-1. 打开 **API 服务**，启用 API。
-2. 选择权限：**只读（readonly）** 或 **可控制（control）**。
-3. 端口默认 `17890`，复制 API Key。
-4. 外网可选：`local` / `sunlogin`（花生壳）/ `frpc`。
-5. 保存并应用。应用内「接口说明」可复制 curl 示例。
+客户端每个刷新周期会同步：权限 / ACL、设备列表与状态、耗材、打印队列、设置、监控区域。
 
-约定：
+---
 
-- Base URL：`http://<主机>:<端口>`，例如 `http://127.0.0.1:17890`
-- 除健康检查外，请求头必须带：`X-Api-Key: <密钥>`
-- 只读模式下写操作返回 `403`
-- 允许 CORS，支持 `OPTIONS` 预检
+## 打印队列与审核
 
-## 客户端
+1. 在设备控制面板 **发送 G 文件打印**（**仅 `.gcode`**）。
+2. 上传前确认：G 文件正确，且为 **本台打印机** 切片软件所切。
+3. 有直接打印权限 → 入该机队列；仅申请权限 → 待审核，通过后入队。
+4. 每台打印机独立队列；管理员（服务端或管理员客户端）任选任务开打。
+5. 开打前弹窗确认：上一盘已取下、热床清空。
+6. 提交者可看自己的排队位次；侧栏「打印审核/队列」可看全表。
 
-### 浏览器
+---
 
-1. 桌面端开启 API（写操作用「可控制」）。
-2. 打开 [`clients/web/index.html`](clients/web/index.html)。
-3. 填写 IP、端口（默认 `17890`）、API Key。
+## 开启 API 服务
+
+仅 **服务端** 托管 API（客户端即使设置里带有 `apiEnabled` 也不会监听端口）。
+
+1. 服务端打开 **API 服务**，确认已启用，端口默认 `17890`。
+2. 模式：`readonly` / `control`。
+3. 请求头：`X-Api-Key: <密钥>` 或用户 JWT `Authorization: Bearer <token>`。
+4. 健康检查：`GET /api/health`（无需密钥）。
+
+详细接口说明见桌面端「API 服务」页内文档。
+
+---
+
+## 其它客户端
+
+### 浏览器（Web）
+
+打开 [`clients/web/index.html`](clients/web/index.html)，填写服务端地址与 API Key。
 
 ### Android
 
@@ -104,243 +150,38 @@ npm run dist
 npm run sync:android
 ```
 
-用 Android Studio 打开 [`clients/android`](clients/android) 运行或打包。详见 [`clients/android/README.md`](clients/android/README.md)。
+用 Android Studio 打开 [`clients/android`](clients/android)。说明见 [`clients/android/README.md`](clients/android/README.md)。
 
 ### PHP
 
-复制 [`clients/php/config.sample.php`](clients/php/config.sample.php) 为 `config.php`（勿提交 `config.php`），填写 `API_BASE` 与 `API_KEY`，使用 [`clients/php/lib/ApiClient.php`](clients/php/lib/ApiClient.php) 调用接口。
+复制 [`clients/php/config.sample.php`](clients/php/config.sample.php) 为 `config.php` 后按示例调用。
 
 ---
 
-## HTTP API
+## 配置与安全
 
-### 通用
+- 数据默认在 Electron `userData`（可自定义数据根目录）。
+- 常见文件：`devices.json`、`filament-spools.json`、`users.json`、`print-requests.json`、`app-settings.json`、`secrets.bin`。
+- 设备密钥使用 Electron `safeStorage` 加密；勿将 `secrets.bin`、真实 `config.php`、密钥提交到 Git。
+- 生产环境请修改默认管理员密码，并限制 API 暴露范围。
 
-| 项 | 说明 |
-|----|------|
-| 默认端口 | `17890` |
-| 鉴权 | 请求头 `X-Api-Key`（`GET /api/health` 除外） |
-| 模式 | `readonly` / `control` |
-| 成功 | 多数含 `"ok": true` |
-| 常见错误 | `401` Key 无效 · `403` 只读禁止写 · `404` 不存在 · `400` 参数错误 · `502` 适配器失败 |
+---
 
-### 健康检查
-
-```http
-GET /api/health
-```
-
-无需 Key。
-
-```json
-{ "ok": true, "version": "0.3.0", "mode": "readonly", "time": "2026-01-01T00:00:00.000Z" }
-```
-
-```bash
-curl "http://127.0.0.1:17890/api/health"
-```
-
-### 实时与汇总
-
-#### `GET /api/v1/events`（SSE）
-
-连接后先收到 `hello`，随后持续推送 `statuses`（全设备状态快照）。
-
-#### `GET /api/v1/summary`
-
-```bash
-curl -H "X-Api-Key: YOUR_KEY" "http://127.0.0.1:17890/api/v1/summary"
-```
-
-```json
-{
-  "ok": true,
-  "devices": { "total": 3, "fdm": 2, "resin": 1, "online": 2 },
-  "filament": { "total": 10, "fdm": 8, "resin": 2 },
-  "monitor": { "zones": 1, "zoneCameras": 2 },
-  "mode": "control"
-}
-```
-
-可选开启 Webhook：向 `webhookUrl` POST 状态 JSON，并附带 `X-Api-Key`。
-
-### 设置与日志
-
-| 方法 | 路径 | 模式 | 说明 |
-|------|------|------|------|
-| GET | `/api/v1/settings` | 任意 | 公开设置；Key 仅返回掩码 |
-| PATCH | `/api/v1/settings` | control | 更新白名单字段 |
-| GET | `/api/v1/logs` | 任意 | `?limit=`（1–500）`?deviceId=` |
-| DELETE | `/api/v1/logs` | control | 清空日志 |
-
-PATCH 允许字段：`apiEnabled`、`apiMode`、`apiPort`、`apiKey`、`apiAccessMode`、`publicIp`、`domain`、`notifyOnError`、`notifyOnPrintDone`、`notifyOnIdle`、`notifyOnLowFilament`、`amsAutoDeduct`、`deviceRefreshSec`、`webhookEnabled`、`webhookUrl`、`openAtLogin`、`minimizeToTray`。
-
-### 设备
-
-| 方法 | 路径 | 模式 | 说明 |
-|------|------|------|------|
-| GET | `/api/v1/devices` | 任意 | 列表 + `status`；`?tech=fdm\|resin` |
-| GET | `/api/v1/devices/:id` | 任意 | 单台详情 |
-| POST | `/api/v1/devices` | control | 新增 |
-| PATCH / PUT | `/api/v1/devices/:id` | control | 更新；可传 `secret` 或 `clearSecret` |
-| DELETE | `/api/v1/devices/:id` | control | 删除并清理密钥 |
-
-新增示例（Moonraker）：
-
-```bash
-curl -X POST \
-  -H "Content-Type: application/json" \
-  -H "X-Api-Key: YOUR_KEY" \
-  -d '{"name":"P1","brand":"klipper","tech":"fdm","connectionMode":"lan","baseUrl":"http://192.168.1.10:7125","secret":"moonraker-api-key"}' \
-  "http://127.0.0.1:17890/api/v1/devices"
-```
-
-拓竹局域网需提供 `bambuHost`（或可用的 `baseUrl`）。响应中密钥不回显。
-
-### 控制与文件
-
-| 方法 | 路径 | 模式 | 说明 |
-|------|------|------|------|
-| POST | `/api/v1/devices/:id/control` | control | Body 必含 `action` |
-| POST | `/api/v1/devices/:id/filament/load` | control | 进料 |
-| POST | `/api/v1/devices/:id/filament/unload` | control | 退料 |
-| GET | `/api/v1/devices/:id/files` | 任意 | 列出机内文件 |
-| POST | `/api/v1/devices/:id/files` | control | `{ "filename", "contentBase64" }` |
-| GET | `/api/v1/devices/:id/files/content` | 任意 | `?path=`；`format=json\|binary` |
-| DELETE | `/api/v1/devices/:id/files/content` | control | 当前返回 501 |
-
-控制 `action`：
-
-| action | 额外字段 |
-|--------|----------|
-| `pause` / `resume` / `cancel` / `emergency_stop` / `home` | — |
-| `set_temp` | `heater`、`temperature` |
-| `set_fan` | `percent`；可选 `fan`（`part`/`chamber`）或 `fanName` |
-| `set_speed` | `percent` |
-| `print_file` | `filename` |
-| `load_filament` / `unload_filament` | 可选 `temperature`、`slot` |
-
-```bash
-curl -X POST \
-  -H "Content-Type: application/json" \
-  -H "X-Api-Key: YOUR_KEY" \
-  -d '{"action":"pause"}' \
-  "http://127.0.0.1:17890/api/v1/devices/DEVICE_ID/control"
-```
-
-### 批量与发现
-
-| 方法 | 路径 | 模式 | 说明 |
-|------|------|------|------|
-| POST | `/api/v1/batch/control` | control | `{ "deviceIds", "action", … }` |
-| POST | `/api/v1/batch/print` | control | `{ "deviceIds", "filename", "contentBase64?" }` |
-| POST | `/api/v1/discover/lan` | control | 启动扫描；可选 `{ "brands": [...] }` |
-| GET | `/api/v1/discover/lan` | 任意 | 进度与结果 |
-| DELETE | `/api/v1/discover/lan` | control | 取消 |
-
-### 耗材
-
-| 方法 | 路径 | 模式 | 说明 |
-|------|------|------|------|
-| GET | `/api/v1/filament` | 任意 | `?tech=` `?archived=0\|1` |
-| GET | `/api/v1/filament/:id` | 任意 | 详情 |
-| POST | `/api/v1/filament` | control | 新建 |
-| PUT / PATCH | `/api/v1/filament/:id` | control | 更新 |
-| DELETE | `/api/v1/filament/:id` | control | 删除 |
-| POST | `/api/v1/filament/:id/archive` | control | 归档 |
-| POST | `/api/v1/filament/:id/bind` | control | `{ "deviceId", "slotId" }`（0=外挂，≥1=AMS） |
-| POST | `/api/v1/filament/:id/unbind` | control | 解绑 |
-
-新建必填：`brandId`、`material`、`color`、`totalGrams`（>0）。可选 `rolls`、`amsBindings`、`remainGrams`、`price`、`tech` 等。
-
-### 监控与摄像头
-
-| 方法 | 路径 | 模式 | 说明 |
-|------|------|------|------|
-| GET | `/api/v1/monitor/wall` | 任意 | 舱内摄像头墙 |
-| GET | `/api/v1/devices/:id/cameras` | 任意 | 单机摄像头 |
-| GET | `/api/v1/devices/:id/cameras/:cameraId/snapshot` | 任意 | JPEG；`?format=json` |
-| GET / POST / PUT | `/api/v1/monitor/zones` | 写需 control | 区域分区 |
-| GET / PATCH / PUT / DELETE | `/api/v1/monitor/zones/:zoneId` | 写需 control | 分区操作 |
-| POST | `/api/v1/monitor/zones/:zoneId/cameras` | control | `{ "name?", "url", "snapshotUrl?" }` |
-| GET / PATCH / PUT / DELETE | `…/cameras/:cameraId` | 写需 control | 区域摄像头 |
-| GET | `…/cameras/:cameraId/snapshot` | 任意 | 区域抓帧 |
-
-### 代打报价
-
-只读模式可用。
-
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| GET | `/api/v1/quote/presets` | 预设材料与功率 |
-| POST | `/api/v1/quote/calculate` | 成本计算 |
-| POST | `/api/v1/quote/parse-gcode` | `{ "text" }` 或 `{ "gcode" }` |
-
-计算常用字段：`weightG`、`printHours`（或小时+分钟拆分）、`wastePct`、`watts`、`electricity`、`wearPerHour`、`laborMinutes`、`laborRate`、`packaging`、`shipping`、`failPct`、`pricingMode`（`markup`/`margin`）、`markupPct`/`marginPct`、`minPrice`、`qty`；可用 `pricePerKg` 或 `options[]`。
-
-### 端点速查
-
-| 类别 | 方法 | 路径 |
-|------|------|------|
-| 健康 | GET | `/api/health` |
-| 实时 | GET | `/api/v1/events` |
-| 汇总 | GET | `/api/v1/summary` |
-| 设置 | GET / PATCH | `/api/v1/settings` |
-| 日志 | GET / DELETE | `/api/v1/logs` |
-| 设备 | GET / POST / PATCH / PUT / DELETE | `/api/v1/devices`、`/devices/:id` |
-| 控制 | POST | `/api/v1/devices/:id/control` |
-| 文件 | GET / POST | `/api/v1/devices/:id/files` |
-| 批量 | POST | `/api/v1/batch/control`、`/batch/print` |
-| 发现 | POST / GET / DELETE | `/api/v1/discover/lan` |
-| 耗材 | CRUD + bind/unbind/archive | `/api/v1/filament…` |
-| 监控 | wall / zones / snapshot | `/api/v1/monitor…` |
-| 报价 | GET / POST | `/api/v1/quote/…` |
-
-## 配置说明
-
-配置保存在 `app-settings.json`（应用数据目录，不进仓库）：
-
-| 键 | 默认 | 含义 |
-|----|------|------|
-| `apiEnabled` | `false` | 是否启动 API |
-| `apiMode` | `readonly` | `readonly` / `control` |
-| `apiPort` | `17890` | 端口 |
-| `apiKey` | 随机生成 | 鉴权密钥 |
-| `apiAccessMode` | `local` | `local` / `sunlogin` / `frpc` |
-| `amsAutoDeduct` | `true` | 耗材自动扣减 |
-| `deviceRefreshSec` | `3` | 状态刷新间隔（秒） |
-| `webhookEnabled` / `webhookUrl` | — | 状态 Webhook |
-| `notifyOn*` | — | 桌面通知开关 |
-| `openAtLogin` / `minimizeToTray` | — | 开机 / 托盘 |
-
-打包安装包时，若缺少 `build/vc_redist.x64.exe`，可从 [Microsoft VC++ Redistributable](https://aka.ms/vc14/vc_redist.x64.exe) 下载放到 `build/`。
-
-## 安全建议
-
-- 不要把打印机原生端口直接暴露到公网；优先隧道（花生壳 / frpc）+ 本软件 API Key。
-- API Key 等同控制权，勿写入公开仓库或发给他人。
-- Web / Android 客户端会在本机保存 Key，注意设备安全。
-- 仓库中不要提交 `config.php`、`local.properties`、`secrets.bin`、设备列表等本地数据。
-
-## 目录结构
+## 项目结构
 
 ```
-printer-monitor/
-├── src/
-│   ├── main/          # Electron 主进程、品牌适配器、HTTP API
-│   ├── preload/       # 预加载桥接
-│   └── renderer/      # React 桌面 UI
-├── clients/
-│   ├── web/           # 浏览器客户端
-│   ├── android/       # Android WebView 客户端
-│   └── php/           # PHP 调用库
-├── build/             # NSIS 脚本、VC++ 红包安装包
-├── resources/         # 图标与运行时 DLL
-├── package.json
-└── README.md
+├── src/main/          # Electron 主进程、API、认证、队列
+├── src/renderer/      # React 界面
+├── src/preload/       # 预加载桥
+├── src/shared/        # 权限、角色、SSO 等共享类型
+├── clients/web/       # 浏览器客户端
+├── clients/android/   # Android WebView 客户端
+├── clients/php/       # PHP 示例
+├── build/             # 安装器脚本与资源
+└── package.json
 ```
 
-桌面端是唯一与打印机原生协议通信的进程；远程客户端只访问统一 HTTP API。
+---
 
 ## License
 

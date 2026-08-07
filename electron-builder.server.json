@@ -1,0 +1,11 @@
+﻿{
+  "directories": {
+    "output": "release-server"
+  },
+  "executableName": "hanye-printer-server",
+  "productName": "hanye-printer-server",
+  "extraMetadata": {
+    "hanyeAppRole": "server",
+    "productName": "hanye-printer-server"
+  }
+}

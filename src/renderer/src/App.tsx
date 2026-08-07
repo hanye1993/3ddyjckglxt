@@ -32,8 +32,15 @@ import { ToolsPage } from './components/ToolsPage'
 import { ModelSitesPage } from './components/ModelSitesPage'
 import { AiModelSitesPage } from './components/AiModelSitesPage'
 import { WindowControls } from './components/WindowControls'
+import { LoginPage } from './components/LoginPage'
+import { BindSsoPage } from './components/BindSsoPage'
+import { UsersPage } from './components/UsersPage'
+import { PrintApprovalPage } from './components/PrintApprovalPage'
 import { useFilamentStore, selectVisibleSpools } from './stores/filamentStore'
+import { usePrintQueueStore } from './stores/printQueueStore'
 import { useSettingsStore, resolveDeviceRefreshMs } from './stores/settingsStore'
+import { useAuthStore, useAuthGrants } from './stores/authStore'
+import { useMonitorStore } from './stores/monitorStore'
 import { applyAppearance, getUiTheme } from './theme/appearance'
 import type { ControlPayload, PrinterTech } from './types/printer'
 import appIcon from './assets/icon.png'
@@ -56,20 +63,22 @@ export default function App() {
   const printerTech: PrinterTech | null =
     section === 'fdm' ? 'fdm' : section === 'resin' ? 'resin' : null
 
-  const visible = useMemo(
-    () =>
-      printerTech
-        ? selectVisibleDevices({ devices, filter, search, tech: printerTech })
-        : [],
-    [devices, filter, search, printerTech]
-  )
+  const { permissions, deviceAcl, can, canDevice, canOpenDevice } = useAuthGrants()
+
+  const visible = useMemo(() => {
+    if (!printerTech) return []
+    const list = selectVisibleDevices({ devices, filter, search, tech: printerTech })
+    return list.filter((d) => canDevice(d.id, 'view'))
+  }, [devices, filter, search, printerTech, permissions, deviceAcl, canDevice])
 
   const sectionCount = useMemo(
     () =>
       printerTech
-        ? devices.filter((d) => deviceTech(d) === printerTech).length
+        ? devices.filter(
+            (d) => deviceTech(d) === printerTech && canDevice(d.id, 'view')
+          ).length
         : 0,
-    [devices, printerTech]
+    [devices, printerTech, permissions, deviceAcl, canDevice]
   )
 
   const [addOpen, setAddOpen] = useState(false)
@@ -97,6 +106,8 @@ export default function App() {
   const isModels = section === 'models'
   const isAiModels = section === 'aiModels'
   const isSettings = section === 'settings'
+  const isUsers = section === 'users'
+  const isPrintApprove = section === 'printApprove'
 
   const filamentVisibleCount = useFilamentStore((s) =>
     isFilament
@@ -116,19 +127,31 @@ export default function App() {
     isFilament ? s.spools.filter((x) => !x.archived).length : 0
   )
 
-  useEffect(() => {
-    void init()
-    void settingsInit()
-  }, [init, settingsInit])
+  const authReady = useAuthStore((s) => s.ready)
+  const role = useAuthStore((s) => s.role)
+  const authed = useAuthStore((s) => s.isAuthed())
+  const needsSsoBind = useAuthStore((s) => s.needsSsoBind)
 
   useEffect(() => {
+    void useAuthStore.getState().init()
+  }, [])
+
+  useEffect(() => {
+    if (!authReady || !authed) return
+    void init()
+    void settingsInit()
+    void useFilamentStore.getState().init()
+  }, [authReady, authed, init, settingsInit])
+
+  useEffect(() => {
+    if (role === 'client') return
     const unsub = window.electronAPI?.filament?.onChanged?.(() => {
       void useFilamentStore.getState().init()
     })
     return () => {
       unsub?.()
     }
-  }, [])
+  }, [role])
 
   useEffect(() => {
     applyAppearance({
@@ -139,17 +162,77 @@ export default function App() {
     })
   }, [uiTheme, uiBgMode, uiBgColor, uiBgImage])
 
+  // Server: push live statuses into API for remote clients
   useEffect(() => {
-    if (!apiEnabled) return
+    if (role === 'client' || !apiEnabled) return
     const push = () => {
       void window.electronAPI?.api?.pushStatuses(useDeviceStore.getState().statuses)
     }
     push()
     const t = window.setInterval(push, resolveDeviceRefreshMs({ deviceRefreshSec }))
     return () => window.clearInterval(t)
-  }, [apiEnabled, deviceRefreshSec])
+  }, [role, apiEnabled, deviceRefreshSec])
+
+  // Client: pull ACL first, then all server snapshots each refresh tick
+  useEffect(() => {
+    if (role !== 'client' || !authed) return
+    let cancelled = false
+    const pull = () => {
+      void (async () => {
+        // Permissions / deviceAcl must be fresh before UI filters devices
+        await useAuthStore
+          .getState()
+          .refreshMe()
+          .catch(() => undefined)
+        if (cancelled) return
+        await Promise.all([
+          useDeviceStore
+            .getState()
+            .refreshFromServer({ silent: true })
+            .catch(() => undefined),
+          useFilamentStore
+            .getState()
+            .refreshFromServer({ silent: true })
+            .catch(() => undefined),
+          usePrintQueueStore
+            .getState()
+            .refresh({ silent: true })
+            .catch(() => undefined),
+          useSettingsStore
+            .getState()
+            .refreshFromServer({ silent: true })
+            .catch(() => undefined),
+          useMonitorStore
+            .getState()
+            .refreshFromServer({ silent: true })
+            .catch(() => undefined)
+        ])
+      })()
+    }
+    pull()
+    const t = window.setInterval(pull, resolveDeviceRefreshMs({ deviceRefreshSec }))
+    return () => {
+      cancelled = true
+      window.clearInterval(t)
+    }
+  }, [role, authed, deviceRefreshSec])
+
+  // Server: refresh print queue so client-submitted jobs appear without manual refresh
+  useEffect(() => {
+    if (role !== 'server') return
+    const pull = () => {
+      void usePrintQueueStore
+        .getState()
+        .refresh({ silent: true })
+        .catch(() => undefined)
+    }
+    pull()
+    const t = window.setInterval(pull, resolveDeviceRefreshMs({ deviceRefreshSec }))
+    return () => window.clearInterval(t)
+  }, [role, deviceRefreshSec])
 
   useEffect(() => {
+    if (role === 'client') return
     const unsub = window.electronAPI?.api?.onControlRequest((req) => {
       void (async () => {
         try {
@@ -167,18 +250,42 @@ export default function App() {
     return () => {
       unsub?.()
     }
-  }, [control])
+  }, [control, role])
+
+  // Server: handle remote reconnect requests from API clients
+  useEffect(() => {
+    if (role === 'client') return
+    const unsub = window.electronAPI?.api?.onReconnectRequest?.((req) => {
+      void (async () => {
+        try {
+          await reconnectAll()
+          window.electronAPI?.api?.replyReconnect?.({ requestId: req.requestId, ok: true })
+        } catch (err) {
+          window.electronAPI?.api?.replyReconnect?.({
+            requestId: req.requestId,
+            ok: false,
+            message: err instanceof Error ? err.message : String(err)
+          })
+        }
+      })()
+    })
+    return () => {
+      unsub?.()
+    }
+  }, [reconnectAll, role])
 
   useEffect(() => {
+    if (role === 'client') return
     const unsub = window.electronAPI?.devices?.onChanged?.(() => {
       void init()
     })
     return () => {
       unsub?.()
     }
-  }, [init])
+  }, [init, role])
 
   useEffect(() => {
+    if (role === 'client') return
     const unsub = window.electronAPI?.api?.onDeviceOpRequest?.((req) => {
       void (async () => {
         const adapters = useDeviceStore.getState().adapters
@@ -230,9 +337,10 @@ export default function App() {
     return () => {
       unsub?.()
     }
-  }, [])
+  }, [role])
 
   useEffect(() => {
+    if (role === 'client') return
     const unsub = window.electronAPI?.api?.onBatchPrintRequest?.((req) => {
       void (async () => {
         try {
@@ -297,7 +405,7 @@ export default function App() {
     return () => {
       unsub?.()
     }
-  }, [])
+  }, [role])
 
   const selected = useMemo(
     () => devices.find((d) => d.id === selectedId) || null,
@@ -307,7 +415,40 @@ export default function App() {
   const selectedMatchesSection =
     !!selected &&
     !!printerTech &&
-    deviceTech(selected) === printerTech
+    deviceTech(selected) === printerTech &&
+    canOpenDevice(selected.id)
+
+  useEffect(() => {
+    if (selectedId && selected && !canOpenDevice(selected.id)) {
+      selectDevice(null)
+    }
+  }, [selectedId, selected, canOpenDevice, selectDevice, permissions, deviceAcl])
+
+  if (!authReady) {
+    return (
+      <ConfigProvider locale={zhCN} theme={uiThemeDef.antd}>
+        <div className="app-shell" style={{ padding: 48, textAlign: 'center' }}>
+          <Typography.Text type="secondary">加载中…</Typography.Text>
+        </div>
+      </ConfigProvider>
+    )
+  }
+
+  if (role === 'client' && !authed) {
+    return (
+      <ConfigProvider locale={zhCN} theme={uiThemeDef.antd}>
+        <LoginPage />
+      </ConfigProvider>
+    )
+  }
+
+  if (role === 'client' && authed && needsSsoBind) {
+    return (
+      <ConfigProvider locale={zhCN} theme={uiThemeDef.antd}>
+        <BindSsoPage />
+      </ConfigProvider>
+    )
+  }
 
   return (
     <ConfigProvider locale={zhCN} theme={uiThemeDef.antd}>
@@ -316,7 +457,7 @@ export default function App() {
           <div className="app-header-brand">
             <img src={appIcon} alt="" className="app-header-logo" draggable={false} />
             <Typography.Title level={4} className="app-header-title">
-              hanye-3D打印机监控台
+              {role === 'client' ? 'hanye-3D打印机监控台 · 客户端' : 'hanye-3D打印机监控台 · 服务端'}
             </Typography.Title>
           </div>
           <Space className="app-header-actions" size={8} align="center">
@@ -344,21 +485,24 @@ export default function App() {
             ) : null}
             {printerTech ? (
               <Button icon={<ReloadOutlined />} onClick={() => void reconnectAll()}>
-                重连
+                {role === 'client' ? '服务端重连' : '重连'}
               </Button>
             ) : null}
             <Button icon={<FileSearchOutlined />} onClick={() => setLogsOpen(true)}>
               日志
             </Button>
-            {printerTech ? (
+            {printerTech && can('device.create') ? (
               <Button type="primary" icon={<PlusOutlined />} onClick={() => setAddOpen(true)}>
                 {printerTech === 'resin' ? '添加光固化' : '添加 FDM'}
               </Button>
             ) : null}
-            {isFilament ? (
+            {isFilament && can('filament.create') ? (
               <Button type="primary" icon={<PlusOutlined />} onClick={() => openFilamentAdd()}>
                 添加料卷
               </Button>
+            ) : null}
+            {role === 'client' ? (
+              <Button onClick={() => useAuthStore.getState().logout()}>退出登录</Button>
             ) : null}
           </Space>
           <WindowControls />
@@ -402,6 +546,10 @@ export default function App() {
               <ModelSitesPage />
             ) : isAiModels ? (
               <AiModelSitesPage />
+            ) : isUsers ? (
+              <UsersPage />
+            ) : isPrintApprove ? (
+              <PrintApprovalPage />
             ) : isSettings ? (
               <SoftSettingsPage />
             ) : null}

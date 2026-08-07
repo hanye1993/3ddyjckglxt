@@ -7,6 +7,14 @@ import type {
   PrinterTech
 } from '../types/printer'
 import { onStatusBatchForAmsDeduct } from '../utils/amsDeduct'
+import { useAuthStore, apiFetch } from './authStore'
+import {
+  isClientMode,
+  serverBatchPrint,
+  serverFetchDevices,
+  serverReconnectAndFetchDevices,
+  serverSend
+} from '../api/serverClient'
 
 export function deviceTech(device: DeviceConfig): PrinterTech {
   return device.tech || 'fdm'
@@ -34,6 +42,8 @@ export type AppSection =
   | 'models'
   | 'aiModels'
   | 'settings'
+  | 'users'
+  | 'printApprove'
 
 /** 每页卡片数；0 = 全部 */
 export type DevicePageSize = 10 | 20 | 50 | 100 | 0
@@ -79,6 +89,8 @@ interface DeviceState {
   removeDevice: (id: string) => Promise<void>
   updateDevice: (device: DeviceConfig) => Promise<void>
   reconnectAll: () => Promise<void>
+  /** Client: pull latest devices/statuses from server (no local printer IO) */
+  refreshFromServer: (opts?: { silent?: boolean }) => Promise<void>
   control: (deviceId: string, payload: ControlPayload) => Promise<void>
   /** pause / resume / cancel on many devices */
   batchControl: (
@@ -183,6 +195,16 @@ export const useDeviceStore = create<DeviceState>((set, get) => {
 
   init: async () => {
     set({ loading: true })
+    if (isClientMode()) {
+      try {
+        await get().refreshFromServer()
+      } catch (e) {
+        console.error(e)
+        set({ loading: false, devices: [], adapters: {} })
+      }
+      return
+    }
+
     const raw = ((await window.electronAPI?.devices.load()) || []) as DeviceConfig[]
     let loaded = raw
       .filter(
@@ -204,7 +226,6 @@ export const useDeviceStore = create<DeviceState>((set, get) => {
       })
       localStorage.setItem(wipeKey, '1')
     } else {
-      // 之后仍拒绝非拓竹云设备落盘残留
       loaded = loaded.filter(
         (d) => !(d.connectionMode === 'cloud' && d.brand !== 'bambu')
       )
@@ -218,6 +239,66 @@ export const useDeviceStore = create<DeviceState>((set, get) => {
       bambuPluginHint: plugin && !plugin.installed ? plugin.hint : null
     })
     await get().reconnectAll()
+  },
+
+  refreshFromServer: async (opts) => {
+    const silent = Boolean(opts?.silent)
+    if (!silent) set({ loading: true })
+    try {
+      const { devices: rawList } = await serverFetchDevices()
+      const loaded: DeviceConfig[] = []
+      const incoming: Record<string, PrinterLiveStatus> = {}
+      for (const row of rawList as Array<DeviceConfig & { status?: PrinterLiveStatus }>) {
+        const { status, ...rest } = row
+        loaded.push({ ...rest, tech: rest.tech || 'fdm' })
+        if (status && rest.id) incoming[rest.id] = status
+      }
+
+      const prev = get()
+      const devicesChanged =
+        prev.devices.length !== loaded.length ||
+        JSON.stringify(prev.devices) !== JSON.stringify(loaded)
+
+      const nextStatuses: Record<string, PrinterLiveStatus> = { ...prev.statuses }
+      let statusesChanged = false
+      const keepIds = new Set(loaded.map((d) => d.id))
+      for (const id of Object.keys(nextStatuses)) {
+        if (!keepIds.has(id)) {
+          delete nextStatuses[id]
+          statusesChanged = true
+        }
+      }
+      for (const [id, st] of Object.entries(incoming)) {
+        const old = nextStatuses[id]
+        if (
+          !old ||
+          old.health !== st.health ||
+          old.state !== st.state ||
+          old.progress !== st.progress ||
+          old.updatedAt !== st.updatedAt ||
+          JSON.stringify(old) !== JSON.stringify(st)
+        ) {
+          nextStatuses[id] = st
+          statusesChanged = true
+        }
+      }
+
+      if (!devicesChanged && !statusesChanged) {
+        if (!silent) set({ loading: false })
+        return
+      }
+
+      set({
+        devices: devicesChanged ? loaded : prev.devices,
+        statuses: statusesChanged ? nextStatuses : prev.statuses,
+        loading: false,
+        adapters: {},
+        bambuPluginHint: null
+      })
+    } catch (e) {
+      if (!silent) set({ loading: false })
+      throw e
+    }
   },
 
   setSection: (section) => {
@@ -261,6 +342,14 @@ export const useDeviceStore = create<DeviceState>((set, get) => {
   clearChecked: () => set({ checkedIds: [] }),
 
   addDevice: async (device, apiKey) => {
+    if (isClientMode()) {
+      await serverSend('/api/v1/devices', 'POST', {
+        ...device,
+        secret: apiKey
+      })
+      await get().refreshFromServer()
+      return
+    }
     if (apiKey && device.secretKey) {
       await window.electronAPI?.secrets.set(device.secretKey, apiKey)
     }
@@ -284,6 +373,11 @@ export const useDeviceStore = create<DeviceState>((set, get) => {
   },
 
   removeDevice: async (id) => {
+    if (isClientMode()) {
+      await serverSend(`/api/v1/devices/${encodeURIComponent(id)}`, 'DELETE')
+      await get().refreshFromServer()
+      return
+    }
     const { devices, adapters } = get()
     const device = devices.find((d) => d.id === id)
     const adapter = adapters[id]
@@ -306,12 +400,42 @@ export const useDeviceStore = create<DeviceState>((set, get) => {
   },
 
   updateDevice: async (device) => {
+    if (isClientMode()) {
+      await serverSend(`/api/v1/devices/${encodeURIComponent(device.id)}`, 'PATCH', device)
+      await get().refreshFromServer()
+      return
+    }
     const devices = get().devices.map((d) => (d.id === device.id ? device : d))
     set({ devices })
     persistDevices(devices)
   },
 
   reconnectAll: async () => {
+    // Client: never talk to printers — ask server to reconnect, then pull snapshot
+    if (isClientMode()) {
+      set({ loading: true })
+      try {
+        const { devices: rawList } = await serverReconnectAndFetchDevices()
+        const loaded: DeviceConfig[] = []
+        const statuses: Record<string, PrinterLiveStatus> = {}
+        for (const row of rawList as Array<DeviceConfig & { status?: PrinterLiveStatus }>) {
+          const { status, ...rest } = row
+          loaded.push({ ...rest, tech: rest.tech || 'fdm' })
+          if (status && rest.id) statuses[rest.id] = status
+        }
+        set({
+          devices: loaded,
+          statuses: { ...get().statuses, ...statuses },
+          loading: false,
+          adapters: {}
+        })
+      } catch (e) {
+        set({ loading: false })
+        throw e
+      }
+      return
+    }
+
     const { devices, adapters: old } = get()
     await Promise.all(Object.values(old).map((a) => a.disconnect().catch(() => undefined)))
     const adapters: Record<string, PrinterAdapter> = {}
@@ -333,8 +457,25 @@ export const useDeviceStore = create<DeviceState>((set, get) => {
 
   control: async (deviceId, payload) => {
     const device = get().devices.find((d) => d.id === deviceId)
+    if (!device) throw new Error('设备不存在')
+
+    if (useAuthStore.getState().role === 'client') {
+      const { serverUrl, token, canDevice } = useAuthStore.getState()
+      if (payload.action === 'print_file' && !canDevice(deviceId, 'print') && canDevice(deviceId, 'print.request')) {
+        throw new Error('请在设备面板使用「发送 G 文件打印」提交文件；审核通过后进入队列，由管理员开打')
+      }
+      const res = await apiFetch(serverUrl, `/api/v1/devices/${encodeURIComponent(deviceId)}/control`, {
+        method: 'POST',
+        token,
+        body: JSON.stringify(payload)
+      })
+      const data = (await res.json()) as { ok?: boolean; message?: string }
+      if (!res.ok || !data.ok) throw new Error(data.message || '控制失败')
+      return
+    }
+
     const adapter = get().adapters[deviceId]
-    if (!device || !adapter) throw new Error('设备未连接')
+    if (!adapter) throw new Error('设备未连接')
     try {
       await adapter.control(payload)
       await window.electronAPI?.logs.append({
@@ -381,6 +522,48 @@ export const useDeviceStore = create<DeviceState>((set, get) => {
 
   batchUploadAndPrint: async (deviceIds, files, onProgress) => {
     if (!files.length) throw new Error('请选择 G-code 文件')
+
+    if (isClientMode()) {
+      const results: BatchPrintResult[] = []
+      const total = deviceIds.length
+      for (let i = 0; i < deviceIds.length; i++) {
+        const deviceId = deviceIds[i]
+        const device = get().devices.find((d) => d.id === deviceId)
+        const file = files.length === 1 ? files[0] : files[i] || files[files.length - 1]
+        const deviceName = device?.name || deviceId
+        try {
+          const buf = await file.arrayBuffer()
+          const bytes = new Uint8Array(buf)
+          let binary = ''
+          for (let j = 0; j < bytes.length; j++) binary += String.fromCharCode(bytes[j]!)
+          const list = await serverBatchPrint({
+            deviceIds: [deviceId],
+            filename: file.name,
+            contentBase64: btoa(binary)
+          })
+          const one = list[0] || { deviceId, deviceName, ok: false, message: '无结果' }
+          const r: BatchPrintResult = {
+            deviceId,
+            deviceName: one.deviceName || deviceName,
+            ok: one.ok,
+            message: one.message || file.name
+          }
+          results.push(r)
+          onProgress?.(i + 1, total, r)
+        } catch (err) {
+          const r: BatchPrintResult = {
+            deviceId,
+            deviceName,
+            ok: false,
+            message: err instanceof Error ? err.message : String(err)
+          }
+          results.push(r)
+          onProgress?.(i + 1, total, r)
+        }
+      }
+      return results
+    }
+
     const { devices, adapters } = get()
     const results: BatchPrintResult[] = []
     const total = deviceIds.length

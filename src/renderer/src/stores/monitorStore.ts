@@ -1,11 +1,13 @@
 import { create } from 'zustand'
 import type { MonitorZone, ZoneCamera } from '../types/monitor'
+import { isClientMode, serverGet, serverSend } from '../api/serverClient'
 
 type MonitorState = {
   zones: MonitorZone[]
   loading: boolean
   activeZoneId: string | null
   init: () => Promise<void>
+  refreshFromServer: (opts?: { silent?: boolean }) => Promise<void>
   setActiveZoneId: (id: string | null) => void
   addZone: (name: string) => Promise<MonitorZone>
   renameZone: (id: string, name: string) => Promise<void>
@@ -19,6 +21,7 @@ type MonitorState = {
 }
 
 function persist(zones: MonitorZone[]): void {
+  if (isClientMode()) return
   void window.electronAPI?.monitor?.save(zones)
 }
 
@@ -31,6 +34,21 @@ export const useMonitorStore = create<MonitorState>((set, get) => ({
 
   init: async () => {
     set({ loading: true })
+    if (isClientMode()) {
+      try {
+        const data = await serverGet<{ zones?: MonitorZone[] }>('/api/v1/monitor/zones')
+        const zones = Array.isArray(data.zones) ? data.zones : []
+        set({
+          zones,
+          loading: false,
+          activeZoneId: get().activeZoneId || zones[0]?.id || null
+        })
+      } catch (e) {
+        console.error(e)
+        set({ zones: [], loading: false })
+      }
+      return
+    }
     const raw = ((await window.electronAPI?.monitor?.load()) || []) as MonitorZone[]
     const zones = Array.isArray(raw) ? raw : []
     set({
@@ -46,9 +64,40 @@ export const useMonitorStore = create<MonitorState>((set, get) => ({
     }
   },
 
+  refreshFromServer: async (opts) => {
+    if (!isClientMode()) return
+    const silent = Boolean(opts?.silent)
+    if (!silent) set({ loading: true })
+    try {
+      const data = await serverGet<{ zones?: MonitorZone[] }>('/api/v1/monitor/zones')
+      const zones = Array.isArray(data.zones) ? data.zones : []
+      const prev = get().zones
+      if (JSON.stringify(prev) === JSON.stringify(zones)) {
+        if (!silent) set({ loading: false })
+        return
+      }
+      set({
+        zones,
+        loading: false,
+        activeZoneId: get().activeZoneId || zones[0]?.id || null
+      })
+    } catch (e) {
+      console.error(e)
+      if (!silent) set({ loading: false })
+    }
+  },
+
   setActiveZoneId: (activeZoneId) => set({ activeZoneId }),
 
   addZone: async (name) => {
+    if (isClientMode()) {
+      const data = await serverSend<{ zone: MonitorZone }>('/api/v1/monitor/zones', 'POST', {
+        name
+      })
+      await get().init()
+      if (data.zone?.id) set({ activeZoneId: data.zone.id })
+      return data.zone
+    }
     const now = new Date().toISOString()
     const zone: MonitorZone = {
       id: crypto.randomUUID(),
@@ -66,6 +115,11 @@ export const useMonitorStore = create<MonitorState>((set, get) => ({
   renameZone: async (id, name) => {
     const n = name.trim()
     if (!n) return
+    if (isClientMode()) {
+      await serverSend(`/api/v1/monitor/zones/${encodeURIComponent(id)}`, 'PATCH', { name: n })
+      await get().init()
+      return
+    }
     const zones = get().zones.map((z) =>
       z.id === id ? { ...z, name: n, updatedAt: new Date().toISOString() } : z
     )
@@ -74,6 +128,11 @@ export const useMonitorStore = create<MonitorState>((set, get) => ({
   },
 
   removeZone: async (id) => {
+    if (isClientMode()) {
+      await serverSend(`/api/v1/monitor/zones/${encodeURIComponent(id)}`, 'DELETE')
+      await get().init()
+      return
+    }
     const zones = get().zones.filter((z) => z.id !== id)
     const activeZoneId =
       get().activeZoneId === id ? zones[0]?.id || null : get().activeZoneId
@@ -82,6 +141,15 @@ export const useMonitorStore = create<MonitorState>((set, get) => ({
   },
 
   addCamera: async (zoneId, input) => {
+    if (isClientMode()) {
+      const data = await serverSend<{ camera?: ZoneCamera }>(
+        `/api/v1/monitor/zones/${encodeURIComponent(zoneId)}/cameras`,
+        'POST',
+        input
+      )
+      await get().init()
+      return data.camera || null
+    }
     const cam: ZoneCamera = {
       ...input,
       id: crypto.randomUUID(),
@@ -104,6 +172,15 @@ export const useMonitorStore = create<MonitorState>((set, get) => ({
   },
 
   updateCamera: async (zoneId, cam) => {
+    if (isClientMode()) {
+      await serverSend(
+        `/api/v1/monitor/zones/${encodeURIComponent(zoneId)}/cameras/${encodeURIComponent(cam.id)}`,
+        'PUT',
+        cam
+      )
+      await get().init()
+      return
+    }
     const zones = get().zones.map((z) =>
       z.id === zoneId
         ? {
@@ -118,6 +195,14 @@ export const useMonitorStore = create<MonitorState>((set, get) => ({
   },
 
   removeCamera: async (zoneId, cameraId) => {
+    if (isClientMode()) {
+      await serverSend(
+        `/api/v1/monitor/zones/${encodeURIComponent(zoneId)}/cameras/${encodeURIComponent(cameraId)}`,
+        'DELETE'
+      )
+      await get().init()
+      return
+    }
     const zones = get().zones.map((z) =>
       z.id === zoneId
         ? {

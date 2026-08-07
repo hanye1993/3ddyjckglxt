@@ -7,6 +7,7 @@ import {
   spoolBindSlotsLeft,
   spoolRolls
 } from '../utils/spoolBinding'
+import { isClientMode, serverGet, serverSend } from '../api/serverClient'
 
 export type FilamentTechTab = 'fdm' | 'resin'
 
@@ -22,6 +23,8 @@ type FilamentState = {
   lowStockThreshold: number
   addModalOpen: boolean
   init: () => Promise<void>
+  /** Client: re-fetch spools from server (silent skips loading flash) */
+  refreshFromServer: (opts?: { silent?: boolean }) => Promise<void>
   setTech: (t: FilamentTechTab) => void
   setSearch: (q: string) => void
   setBrandFilter: (id: string | 'all') => void
@@ -41,6 +44,7 @@ type FilamentState = {
 }
 
 function persist(spools: SpoolRecord[]): void {
+  if (isClientMode()) return
   void window.electronAPI?.filament?.save(spools)
 }
 
@@ -85,11 +89,37 @@ export const useFilamentStore = create<FilamentState>((set, get) => ({
   addModalOpen: false,
 
   init: async () => {
+    if (isClientMode()) {
+      await get().refreshFromServer()
+      return
+    }
     set({ loading: true })
     const raw = ((await window.electronAPI?.filament?.load()) || []) as SpoolRecord[]
     const spools = (Array.isArray(raw) ? raw : []).map((s) => migrateSpoolRecord(s))
     set({ spools, loading: false })
     persist(spools)
+  },
+
+  refreshFromServer: async (opts) => {
+    if (!isClientMode()) return
+    const silent = Boolean(opts?.silent)
+    if (!silent) set({ loading: true })
+    try {
+      const data = await serverGet<{ filament?: SpoolRecord[]; spools?: SpoolRecord[] }>(
+        '/api/v1/filament'
+      )
+      const raw = (data.spools || data.filament || []) as SpoolRecord[]
+      const spools = (Array.isArray(raw) ? raw : []).map((s) => migrateSpoolRecord(s))
+      const prev = get().spools
+      if (JSON.stringify(prev) === JSON.stringify(spools)) {
+        if (!silent) set({ loading: false })
+        return
+      }
+      set({ spools, loading: false })
+    } catch (e) {
+      console.error(e)
+      if (!silent) set({ spools: [], loading: false })
+    }
   },
 
   setTech: (tech) => set({ tech, brandFilter: 'all', materialFilter: 'all' }),
@@ -103,6 +133,11 @@ export const useFilamentStore = create<FilamentState>((set, get) => ({
   closeAddModal: () => set({ addModalOpen: false }),
 
   addSpool: async (input) => {
+    if (isClientMode()) {
+      const data = await serverSend<{ spool?: SpoolRecord }>('/api/v1/filament', 'POST', input)
+      await get().init()
+      return data.spool || (get().spools[0] as SpoolRecord)
+    }
     const now = new Date().toISOString()
     const spool = withSyncedBindings({
       ...input,
@@ -118,6 +153,11 @@ export const useFilamentStore = create<FilamentState>((set, get) => ({
   },
 
   updateSpool: async (spool) => {
+    if (isClientMode()) {
+      await serverSend(`/api/v1/filament/${encodeURIComponent(spool.id)}`, 'PUT', spool)
+      await get().init()
+      return
+    }
     const next = withSyncedBindings({
       ...spool,
       updatedAt: new Date().toISOString()
@@ -128,12 +168,22 @@ export const useFilamentStore = create<FilamentState>((set, get) => ({
   },
 
   removeSpool: async (id) => {
+    if (isClientMode()) {
+      await serverSend(`/api/v1/filament/${encodeURIComponent(id)}`, 'DELETE')
+      await get().init()
+      return
+    }
     const spools = get().spools.filter((s) => s.id !== id)
     set({ spools })
     persist(spools)
   },
 
   archiveSpool: async (id, archived = true) => {
+    if (isClientMode()) {
+      await serverSend(`/api/v1/filament/${encodeURIComponent(id)}/archive`, 'POST', { archived })
+      await get().init()
+      return
+    }
     const spools = get().spools.map((s) =>
       s.id === id ? { ...s, archived, updatedAt: new Date().toISOString() } : s
     )
@@ -152,7 +202,8 @@ export const useFilamentStore = create<FilamentState>((set, get) => ({
     )
     if (!already && spoolBindSlotsLeft(target) <= 0) return false
 
-    const spools = get().spools.map((s) => {
+    const before = get().spools
+    const spools = before.map((s) => {
       let bindings = spoolBindings(s).filter(
         (b) => !(b.deviceId === binding.deviceId && Number(b.slotId) === binding.slotId)
       )
@@ -169,6 +220,18 @@ export const useFilamentStore = create<FilamentState>((set, get) => ({
       }
       return withSyncedBindings({ ...s, amsBindings: bindings, updatedAt: now })
     })
+
+    if (isClientMode()) {
+      for (const s of spools) {
+        const old = before.find((x) => x.id === s.id)
+        if (JSON.stringify(old?.amsBindings) !== JSON.stringify(s.amsBindings)) {
+          await serverSend(`/api/v1/filament/${encodeURIComponent(s.id)}`, 'PUT', s)
+        }
+      }
+      await get().init()
+      return true
+    }
+
     set({ spools })
     persist(spools)
     return true
@@ -176,27 +239,47 @@ export const useFilamentStore = create<FilamentState>((set, get) => ({
 
   unbindSpoolAms: async (spoolId, deviceId, slotId) => {
     const now = new Date().toISOString()
-    const spools = get().spools.map((s) => {
+    const before = get().spools
+    const spools = before.map((s) => {
       if (s.id !== spoolId) return s
       const bindings = spoolBindings(s).filter(
         (b) => !(b.deviceId === deviceId && Number(b.slotId) === slotId)
       )
       return withSyncedBindings({ ...s, amsBindings: bindings, updatedAt: now })
     })
+    if (isClientMode()) {
+      const next = spools.find((s) => s.id === spoolId)
+      if (next) {
+        await serverSend(`/api/v1/filament/${encodeURIComponent(spoolId)}`, 'PUT', next)
+      }
+      await get().init()
+      return
+    }
     set({ spools })
     persist(spools)
   },
 
   clearSlotBinding: async (deviceId, slotId) => {
     const now = new Date().toISOString()
-    const spools = get().spools.map((s) => {
-      const before = spoolBindings(s)
-      const bindings = before.filter(
+    const before = get().spools
+    const spools = before.map((s) => {
+      const prev = spoolBindings(s)
+      const bindings = prev.filter(
         (b) => !(b.deviceId === deviceId && Number(b.slotId) === slotId)
       )
-      if (bindings.length === before.length) return s
+      if (bindings.length === prev.length) return s
       return withSyncedBindings({ ...s, amsBindings: bindings, updatedAt: now })
     })
+    if (isClientMode()) {
+      for (const s of spools) {
+        const old = before.find((x) => x.id === s.id)
+        if (JSON.stringify(old?.amsBindings) !== JSON.stringify(s.amsBindings)) {
+          await serverSend(`/api/v1/filament/${encodeURIComponent(s.id)}`, 'PUT', s)
+        }
+      }
+      await get().init()
+      return
+    }
     set({ spools })
     persist(spools)
   }

@@ -75,6 +75,10 @@ import {
 import { setDevicePollMsGetter } from './pollInterval'
 import { fetchHskMeta, syncHskMapping } from './api/hskClient'
 import { randomUUID } from 'crypto'
+import { newJwtSecret } from './auth/jwt'
+import { UserStore } from './auth/users'
+import { PrintRequestStore } from './auth/printRequests'
+import { resolveAppRole, type AppRole } from '../shared/appRole'
 
 /** Electron 固定配置目录（存放数据根路径指针） */
 const APP_HOME = app.getPath('userData')
@@ -86,9 +90,28 @@ const DATA_FILE_NAMES = [
   'filament-spools.json',
   'monitor-zones.json',
   'app-settings.json',
-  'operation-logs.jsonl'
+  'operation-logs.jsonl',
+  'users.json',
+  'print-requests.json'
 ] as const
 const DATA_DIR_NAMES = ['downloads', 'frpc'] as const
+
+const APP_ROLE: AppRole = resolveAppRole()
+
+let userStore: UserStore | null = null
+let printRequestStore: PrintRequestStore | null = null
+
+function ensureAuthStores(): void {
+  ensureDirs()
+  if (!userStore) {
+    userStore = new UserStore(DATA_ROOT, newJwtSecret())
+  } else {
+    userStore.reloadFromDiskIfNeeded()
+  }
+  if (!printRequestStore) {
+    printRequestStore = new PrintRequestStore(DATA_ROOT)
+  }
+}
 
 let DATA_ROOT = APP_HOME
 let SECRETS_PATH = join(DATA_ROOT, 'secrets.bin')
@@ -279,6 +302,26 @@ async function requestRendererControl(
     }, 30000)
     pendingControls.set(requestId, { resolve, timer })
     mainWindow!.webContents.send('api:control-request', { requestId, deviceId, payload })
+  })
+}
+
+const pendingReconnects = new Map<
+  string,
+  { resolve: (v: { ok: boolean; message?: string }) => void; timer: NodeJS.Timeout }
+>()
+
+async function requestRendererReconnect(): Promise<{ ok: boolean; message?: string }> {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    return { ok: false, message: 'Renderer unavailable — 请保持服务端主窗口运行' }
+  }
+  const requestId = randomUUID()
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      pendingReconnects.delete(requestId)
+      resolve({ ok: false, message: 'Reconnect timed out' })
+    }, 60000)
+    pendingReconnects.set(requestId, { resolve, timer })
+    mainWindow!.webContents.send('api:reconnect-request', { requestId })
   })
 }
 
@@ -570,7 +613,7 @@ const apiServer = new ApiServer({
         appSettings.apiPort !== prev.apiPort ||
         appSettings.apiMode !== prev.apiMode ||
         appSettings.apiKey !== prev.apiKey
-      if (!appSettings.apiEnabled) {
+      if (APP_ROLE !== 'server' || !appSettings.apiEnabled) {
         await apiServer.stop()
       } else if (needRestart || !apiServer.status().running) {
         await apiServer.start()
@@ -581,7 +624,41 @@ const apiServer = new ApiServer({
       return { ok: false, message: err instanceof Error ? err.message : String(err) }
     }
   },
-  version: '0.3.0'
+  version: '0.3.0',
+  getUserStore: () => {
+    ensureAuthStores()
+    return userStore
+  },
+  getPrintRequestStore: () => {
+    ensureAuthStores()
+    return printRequestStore
+  },
+  allowLocalAdmin: APP_ROLE === 'server',
+  onReconnectDevices: () => requestRendererReconnect(),
+  onStartPrintJob: async ({ deviceId, filename, contentBase64 }) => {
+    if (contentBase64) {
+      const up = await requestRendererDeviceOp({
+        deviceId,
+        op: 'uploadFile',
+        filename,
+        contentBase64
+      })
+      if (!up.ok) return { ok: false, message: up.message || '上传失败' }
+    }
+    return requestRendererControl(deviceId, { action: 'print_file', filename })
+  },
+  onApprovedPrint: async ({ deviceId, filename, contentBase64 }) => {
+    if (contentBase64) {
+      const up = await requestRendererDeviceOp({
+        deviceId,
+        op: 'uploadFile',
+        filename,
+        contentBase64
+      })
+      if (!up.ok) return { ok: false, message: up.message || '上传失败' }
+    }
+    return requestRendererControl(deviceId, { action: 'print_file', filename })
+  }
 })
 
 function toBuffer(data: ArrayBuffer | Uint8Array): Buffer {
@@ -667,7 +744,7 @@ function createWindow(): BrowserWindow {
     minWidth: 1024,
     minHeight: 640,
     show: false,
-    title: 'hanye-3D打印机监控台',
+    title: APP_ROLE === 'client' ? 'hanye-3D打印机监控台（客户端）' : 'hanye-3D打印机监控台（服务端）',
     backgroundColor: '#101218',
     icon: iconPath,
     frame: false,
@@ -736,6 +813,169 @@ function writeSecrets(data: Record<string, string>): void {
 }
 
 function registerIpc(): void {
+  ipcMain.handle('app:getRole', () => APP_ROLE)
+
+  ipcMain.handle('auth:localUsers', () => {
+    if (APP_ROLE !== 'server') return { ok: false, message: '仅服务端可本地管理用户' }
+    ensureAuthStores()
+    return { ok: true, users: userStore!.list() }
+  })
+
+  ipcMain.handle('auth:localUpsertUser', (_e, payload: unknown) => {
+    if (APP_ROLE !== 'server') return { ok: false, message: '仅服务端可本地管理用户' }
+    ensureAuthStores()
+    try {
+      const body = (payload || {}) as Record<string, unknown>
+      if (typeof body.id === 'string' && body.id) {
+        const user = userStore!.update(body.id, {
+          displayName: typeof body.displayName === 'string' ? body.displayName : undefined,
+          level: body.level as import('../shared/permissions').UserLevel | undefined,
+          enabled: typeof body.enabled === 'boolean' ? body.enabled : undefined,
+          permissions: Array.isArray(body.permissions) ? (body.permissions as string[]) : undefined,
+          deviceAcl:
+            body.deviceAcl && typeof body.deviceAcl === 'object'
+              ? (body.deviceAcl as Record<string, string[]>)
+              : undefined,
+          password: typeof body.password === 'string' ? body.password : undefined,
+          ssoProvider: body.ssoProvider as import('../shared/sso').SsoProviderId | 'none' | undefined,
+          ssoExternalId: typeof body.ssoExternalId === 'string' ? body.ssoExternalId : undefined
+        })
+        return { ok: true, user }
+      }
+      const user = userStore!.create({
+        username: String(body.username || ''),
+        password: String(body.password || ''),
+        displayName: typeof body.displayName === 'string' ? body.displayName : undefined,
+        level: (body.level as import('../shared/permissions').UserLevel) || 'viewer',
+        permissions: Array.isArray(body.permissions) ? (body.permissions as string[]) : undefined,
+        deviceAcl:
+          body.deviceAcl && typeof body.deviceAcl === 'object'
+            ? (body.deviceAcl as Record<string, string[]>)
+            : undefined,
+        ssoProvider: body.ssoProvider as import('../shared/sso').SsoProviderId | 'none' | undefined,
+        ssoExternalId: typeof body.ssoExternalId === 'string' ? body.ssoExternalId : undefined
+      })
+      return { ok: true, user }
+    } catch (e) {
+      return { ok: false, message: e instanceof Error ? e.message : String(e) }
+    }
+  })
+
+  ipcMain.handle('auth:localDeleteUser', (_e, id: string) => {
+    if (APP_ROLE !== 'server') return { ok: false, message: '仅服务端可本地管理用户' }
+    ensureAuthStores()
+    try {
+      userStore!.remove(String(id || ''))
+      return { ok: true }
+    } catch (e) {
+      return { ok: false, message: e instanceof Error ? e.message : String(e) }
+    }
+  })
+
+  ipcMain.handle('auth:localPrintRequests', (_e, filter?: { status?: string; deviceId?: string }) => {
+    ensureAuthStores()
+    const status = filter?.status
+      ? (filter.status.split(',').map((s) => s.trim()) as import('./auth/printRequests').PrintRequestStatus[])
+      : undefined
+    return {
+      ok: true,
+      requests: printRequestStore!.list({
+        deviceId: filter?.deviceId,
+        status
+      })
+    }
+  })
+
+  ipcMain.handle(
+    'auth:localReviewPrint',
+    async (_e, payload: { id: string; action: 'approve' | 'reject' | 'start' | 'cancel'; note?: string }) => {
+      ensureAuthStores()
+      try {
+        const starter = { id: 'local', name: '本机管理' }
+        if (payload.action === 'approve') {
+          const row = printRequestStore!.approve(payload.id, starter, payload.note)
+          return { ok: true, request: row }
+        }
+        if (payload.action === 'reject') {
+          const row = printRequestStore!.reject(payload.id, starter, payload.note)
+          return { ok: true, request: row }
+        }
+        if (payload.action === 'cancel') {
+          const row = printRequestStore!.cancel(payload.id, starter.id, true)
+          return { ok: true, request: row }
+        }
+        if (payload.action === 'start') {
+          const full = printRequestStore!.markPrinting(payload.id, starter)
+          if (full.contentBase64) {
+            const up = await requestRendererDeviceOp({
+              deviceId: full.deviceId,
+              op: 'uploadFile',
+              filename: full.filename,
+              contentBase64: full.contentBase64
+            })
+            if (!up.ok) {
+              const failed = printRequestStore!.markFailed(payload.id, up.message || '上传失败')
+              return { ok: false, message: up.message || '上传失败', request: failed }
+            }
+          }
+          const result = await requestRendererControl(full.deviceId, {
+            action: 'print_file',
+            filename: full.filename
+          })
+          if (!result.ok) {
+            const failed = printRequestStore!.markFailed(payload.id, result.message || '下发打印失败')
+            return { ok: false, message: result.message || '下发打印失败', request: failed }
+          }
+          const done = printRequestStore!.markDone(payload.id)
+          return { ok: true, request: done }
+        }
+        return { ok: false, message: '未知操作' }
+      } catch (e) {
+        return { ok: false, message: e instanceof Error ? e.message : String(e) }
+      }
+    }
+  )
+
+  ipcMain.handle(
+    'auth:localSubmitPrint',
+    async (
+      _e,
+      payload: {
+        deviceId: string
+        deviceName?: string
+        filename: string
+        contentBase64: string
+        note?: string
+        /** server local always queues directly */
+        status?: 'pending' | 'queued'
+      }
+    ) => {
+      if (APP_ROLE !== 'server') return { ok: false, message: '仅服务端可本地提交' }
+      ensureAuthStores()
+      try {
+        if (!payload.deviceId || !payload.filename || !payload.contentBase64) {
+          return { ok: false, message: '需要 deviceId、filename、contentBase64' }
+        }
+        if (!/\.gcode$/i.test(String(payload.filename))) {
+          return { ok: false, message: '仅支持 .gcode 文件' }
+        }
+        const row = printRequestStore!.create({
+          requesterId: 'local',
+          requesterName: '本机管理',
+          deviceId: payload.deviceId,
+          deviceName: payload.deviceName || payload.deviceId,
+          filename: payload.filename,
+          contentBase64: payload.contentBase64,
+          note: payload.note,
+          status: payload.status || 'queued'
+        })
+        return { ok: true, request: row, queued: true, queuePosition: row.queuePosition }
+      } catch (e) {
+        return { ok: false, message: e instanceof Error ? e.message : String(e) }
+      }
+    }
+  )
+
   ipcMain.handle('secrets:get', (_e, key: string) => {
     const all = readSecrets()
     return all[key] ?? null
@@ -883,7 +1123,7 @@ function registerIpc(): void {
       appSettings.apiMode !== prev.apiMode ||
       appSettings.apiKey !== prev.apiKey
     let status: ApiStatus
-    if (!appSettings.apiEnabled) {
+    if (APP_ROLE !== 'server' || !appSettings.apiEnabled) {
       status = await apiServer.stop()
     } else if (needRestart || !apiServer.status().running) {
       status = await apiServer.start()
@@ -896,12 +1136,18 @@ function registerIpc(): void {
   ipcMain.handle('api:status', () => apiServer.status())
 
   ipcMain.handle('api:start', async () => {
+    if (APP_ROLE !== 'server') {
+      return { ...apiServer.status(), running: false, lastError: '仅服务端可启动 API' }
+    }
     appSettings = { ...appSettings, apiEnabled: true }
     saveAppSettings(appSettings)
     return apiServer.start()
   })
 
   ipcMain.handle('api:stop', async () => {
+    if (APP_ROLE !== 'server') {
+      return apiServer.stop()
+    }
     appSettings = { ...appSettings, apiEnabled: false }
     saveAppSettings(appSettings)
     return apiServer.stop()
@@ -998,6 +1244,17 @@ function registerIpc(): void {
       if (!pending) return
       clearTimeout(pending.timer)
       pendingControls.delete(result.requestId)
+      pending.resolve({ ok: result.ok, message: result.message })
+    }
+  )
+
+  ipcMain.on(
+    'api:reconnect-result',
+    (_e, result: { requestId: string; ok: boolean; message?: string }) => {
+      const pending = pendingReconnects.get(result.requestId)
+      if (!pending) return
+      clearTimeout(pending.timer)
+      pendingReconnects.delete(result.requestId)
       pending.resolve({ ok: result.ok, message: result.message })
     }
   )
@@ -1530,6 +1787,10 @@ function registerIpc(): void {
         if (!existsSync(nextRoot)) mkdirSync(nextRoot, { recursive: true })
         writeDataLocation(nextRoot)
         applyDataRoot(nextRoot)
+        // Drop in-memory auth stores so they reopen under the new data root
+        userStore = null
+        printRequestStore = null
+        ensureAuthStores()
         appSettings = loadAppSettings()
         applyLoginItem()
 
@@ -1614,14 +1875,27 @@ function registerIpc(): void {
 
 app.whenReady().then(async () => {
   ensureDirs()
+  ensureAuthStores()
   setupAppMenu()
   appSettings = loadAppSettings()
+  if (APP_ROLE === 'server') {
+    // Server always hosts API for clients
+    appSettings = normalizeSettings({
+      ...appSettings,
+      apiEnabled: true,
+      apiMode: 'control'
+    })
+    saveAppSettings(appSettings)
+  }
   applyLoginItem()
   registerIpc()
   setupTray()
   mainWindow = createWindow()
-  if (appSettings.apiEnabled) {
+  if (APP_ROLE === 'server' && appSettings.apiEnabled) {
     await apiServer.start()
+  } else if (APP_ROLE !== 'server') {
+    // Client must never host API — shared settings may have apiEnabled=true
+    await apiServer.stop()
   }
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {

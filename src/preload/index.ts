@@ -66,6 +66,66 @@ export type BambuLoginResult =
   | { ok: false; needCode: false; message: string }
 
 const api = {
+  app: {
+    getRole: () => ipcRenderer.invoke('app:getRole') as Promise<'server' | 'client'>
+  },
+  auth: {
+    localUsers: () =>
+      ipcRenderer.invoke('auth:localUsers') as Promise<{
+        ok: boolean
+        users?: Array<{
+          id: string
+          username: string
+          displayName: string
+          level: string
+          enabled: boolean
+          permissions: string[]
+          deviceAcl: Record<string, string[]>
+          createdAt: string
+          updatedAt: string
+        }>
+        message?: string
+      }>,
+    localUpsertUser: (payload: unknown) =>
+      ipcRenderer.invoke('auth:localUpsertUser', payload) as Promise<{
+        ok: boolean
+        user?: unknown
+        message?: string
+      }>,
+    localDeleteUser: (id: string) =>
+      ipcRenderer.invoke('auth:localDeleteUser', id) as Promise<{ ok: boolean; message?: string }>,
+    localPrintRequests: (filter?: { status?: string; deviceId?: string }) =>
+      ipcRenderer.invoke('auth:localPrintRequests', filter) as Promise<{
+        ok: boolean
+        requests?: unknown[]
+        message?: string
+      }>,
+    localReviewPrint: (payload: {
+      id: string
+      action: 'approve' | 'reject' | 'start' | 'cancel'
+      note?: string
+    }) =>
+      ipcRenderer.invoke('auth:localReviewPrint', payload) as Promise<{
+        ok: boolean
+        request?: unknown
+        message?: string
+      }>,
+    localSubmitPrint: (payload: {
+      deviceId: string
+      deviceName?: string
+      filename: string
+      contentBase64: string
+      note?: string
+      status?: 'pending' | 'queued'
+    }) =>
+      ipcRenderer.invoke('auth:localSubmitPrint', payload) as Promise<{
+        ok: boolean
+        request?: unknown
+        queued?: boolean
+        queuePosition?: number
+        message?: string
+      }>
+  },
   window: {
     minimize: () => ipcRenderer.invoke('window:minimize') as Promise<boolean>,
     maximize: () => ipcRenderer.invoke('window:maximize') as Promise<boolean>,
@@ -122,11 +182,14 @@ const api = {
         hskMemo?: string
         frpcServerAddr?: string
         frpcServerPort?: number
+        frpcUser?: string
         frpcToken?: string
+        frpcProxyName?: string
         frpcType?: 'tcp' | 'http'
         frpcRemotePort?: number
         frpcPublicHost?: string
         frpcCustomDomain?: string
+        frpcTlsEnable?: boolean
         notifyOnError?: boolean
         notifyOnPrintDone?: boolean
         notifyOnIdle?: boolean
@@ -158,11 +221,14 @@ const api = {
           hskMemo?: string
           frpcServerAddr?: string
           frpcServerPort?: number
+          frpcUser?: string
           frpcToken?: string
+          frpcProxyName?: string
           frpcType?: 'tcp' | 'http'
           frpcRemotePort?: number
           frpcPublicHost?: string
           frpcCustomDomain?: string
+          frpcTlsEnable?: boolean
           notifyOnError?: boolean
           notifyOnPrintDone?: boolean
           notifyOnIdle?: boolean
@@ -242,6 +308,14 @@ const api = {
     },
     replyControl: (result: { requestId: string; ok: boolean; message?: string }) => {
       ipcRenderer.send('api:control-result', result)
+    },
+    onReconnectRequest: (listener: (req: { requestId: string }) => void) => {
+      const handler = (_event: IpcRendererEvent, req: { requestId: string }) => listener(req)
+      ipcRenderer.on('api:reconnect-request', handler)
+      return () => ipcRenderer.removeListener('api:reconnect-request', handler)
+    },
+    replyReconnect: (result: { requestId: string; ok: boolean; message?: string }) => {
+      ipcRenderer.send('api:reconnect-result', result)
     },
     onDeviceOpRequest: (
       listener: (req: {
@@ -360,11 +434,14 @@ const api = {
               hskMemo?: string
               frpcServerAddr?: string
               frpcServerPort?: number
+              frpcUser?: string
               frpcToken?: string
+              frpcProxyName?: string
               frpcType?: 'tcp' | 'http'
               frpcRemotePort?: number
               frpcPublicHost?: string
               frpcCustomDomain?: string
+              frpcTlsEnable?: boolean
             }
             status: {
               running: boolean

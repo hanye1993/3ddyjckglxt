@@ -24,6 +24,19 @@ import {
   type DeviceControlAction
 } from './controlShared'
 import { handleFullApi, type FullApiDeps } from './fullApi'
+import { verifyJwt } from '../auth/jwt'
+import {
+  assertDeviceControlAllowed,
+  filterDevicesForAuth,
+  handleAuthApi,
+  type AuthApiDeps,
+  type AuthContext
+} from '../auth/authApi'
+import type { UserStore } from '../auth/users'
+import type { PrintRequestStore } from '../auth/printRequests'
+import { effectivePermissions, hasPerm } from '../../shared/permissions'
+import { defaultSsoSettings, normalizeSsoSettings, type SsoSettingsBundle } from '../../shared/sso'
+import { handleSsoPublicApi } from '../auth/ssoApi'
 
 export type { DeviceControlAction }
 export { DEVICE_CONTROL_ACTIONS }
@@ -52,11 +65,17 @@ export type AppSettings = {
   hskMemo?: string
   frpcServerAddr?: string
   frpcServerPort?: number
+  /** 面板账号 / 多用户 frps 的 user（如 DPFRP 的 user） */
+  frpcUser?: string
   frpcToken?: string
+  /** 隧道名称，商业面板通常强制与官方配置一致 */
+  frpcProxyName?: string
   frpcType?: FrpcProxyType
   frpcRemotePort?: number
   frpcPublicHost?: string
   frpcCustomDomain?: string
+  /** 是否启用 frpc→frps TLS；多数面板要求 false */
+  frpcTlsEnable?: boolean
   /** 桌面通知 */
   notifyOnError?: boolean
   notifyOnPrintDone?: boolean
@@ -78,6 +97,8 @@ export type AppSettings = {
   uiBgColor?: string
   /** data URL 或空 */
   uiBgImage?: string
+  /** 企微 / 钉钉 / AD 对接 */
+  sso?: SsoSettingsBundle
 }
 
 /** Clamp and return device refresh interval in seconds */
@@ -236,32 +257,44 @@ export function buildFrpcUrl(settings: AppSettings): string | null {
   return `http://${host}:${remote}`
 }
 
-/** 生成 frpc.toml（v0.52+），本地端口绑定本软件 API */
+/** 生成 frpc.toml（v0.52+ / 面板兼容写法），本地端口绑定本软件 API */
 export function buildFrpcToml(settings: AppSettings): string {
   const serverAddr = (settings.frpcServerAddr || '').trim() || '127.0.0.1'
   const serverPort = Number(settings.frpcServerPort) || 7000
+  const user = (settings.frpcUser || '').trim()
   const token = (settings.frpcToken || '').trim()
+  const proxyName = (settings.frpcProxyName || '').trim() || 'printer-monitor-api'
   const localPort = settings.apiPort || DEFAULT_PORT
   const type = settings.frpcType === 'http' ? 'http' : 'tcp'
   const remotePort = Number(settings.frpcRemotePort) || 0
   const customDomain = (settings.frpcCustomDomain || '').trim()
+  const tlsEnable = settings.frpcTlsEnable === true
 
+  const q = (s: string) => s.replace(/"/g, '')
   const lines = [
     '# hanye-3D打印机监控台 — frpc 配置',
     '# 用法: frpc -c frpc.toml',
+    '# 兼容自建 frps 与 DPFRP 等面板下发的配置格式',
     '',
-    'serverAddr = "' + serverAddr.replace(/"/g, '') + '"',
+    'serverAddr = "' + q(serverAddr) + '"',
     'serverPort = ' + serverPort
   ]
-  if (token) {
-    lines.push('', '[auth]', 'method = "token"', 'token = "' + token.replace(/"/g, '') + '"')
-  }
-  lines.push('', '[[proxies]]', 'name = "printer-monitor-api"', 'type = "' + type + '"')
-  lines.push('localIP = "127.0.0.1"', 'localPort = ' + localPort)
+  if (user) lines.push('user = "' + q(user) + '"')
+  if (token) lines.push('auth.token = "' + q(token) + '"')
+  lines.push(
+    'transport.tls.enable = ' + (tlsEnable ? 'true' : 'false'),
+    'transport.tls.disableCustomTLSFirstByte = false',
+    '',
+    '[[proxies]]',
+    'name = "' + q(proxyName) + '"',
+    'type = "' + type + '"',
+    'localIP = "127.0.0.1"',
+    'localPort = ' + localPort
+  )
   if (type === 'tcp') {
     lines.push('remotePort = ' + (remotePort || localPort))
   } else if (customDomain) {
-    lines.push('customDomains = ["' + customDomain.replace(/"/g, '') + '"]')
+    lines.push('customDomains = ["' + q(customDomain) + '"]')
   }
   lines.push('')
   return lines.join('\n')
@@ -284,11 +317,14 @@ export function defaultSettings(): AppSettings {
     hskMemo: HSK_DEFAULT_MEMO,
     frpcServerAddr: '',
     frpcServerPort: 7000,
+    frpcUser: '',
     frpcToken: '',
+    frpcProxyName: '',
     frpcType: 'tcp',
     frpcRemotePort: 17890,
     frpcPublicHost: '',
     frpcCustomDomain: '',
+    frpcTlsEnable: false,
     notifyOnError: true,
     notifyOnPrintDone: true,
     notifyOnIdle: false,
@@ -302,7 +338,8 @@ export function defaultSettings(): AppSettings {
     uiTheme: 'midnight',
     uiBgMode: 'default',
     uiBgColor: '#0f1115',
-    uiBgImage: ''
+    uiBgImage: '',
+    sso: defaultSsoSettings()
   }
 }
 
@@ -353,7 +390,9 @@ export function normalizeSettings(raw: unknown): AppSettings {
       Number.isFinite(frpcServerPort) && frpcServerPort > 0 && frpcServerPort < 65536
         ? Math.floor(frpcServerPort)
         : 7000,
+    frpcUser: typeof o.frpcUser === 'string' ? o.frpcUser.trim() : '',
     frpcToken: typeof o.frpcToken === 'string' ? o.frpcToken.trim() : '',
+    frpcProxyName: typeof o.frpcProxyName === 'string' ? o.frpcProxyName.trim() : '',
     frpcType: o.frpcType === 'http' ? 'http' : 'tcp',
     frpcRemotePort:
       Number.isFinite(frpcRemotePort) && frpcRemotePort > 0 && frpcRemotePort < 65536
@@ -361,6 +400,7 @@ export function normalizeSettings(raw: unknown): AppSettings {
         : DEFAULT_PORT,
     frpcPublicHost: typeof o.frpcPublicHost === 'string' ? o.frpcPublicHost.trim() : '',
     frpcCustomDomain: typeof o.frpcCustomDomain === 'string' ? o.frpcCustomDomain.trim() : '',
+    frpcTlsEnable: o.frpcTlsEnable === true,
     notifyOnError: o.notifyOnError !== false,
     notifyOnPrintDone: o.notifyOnPrintDone !== false,
     notifyOnIdle: Boolean(o.notifyOnIdle),
@@ -382,7 +422,8 @@ export function normalizeSettings(raw: unknown): AppSettings {
         ? o.uiBgImage.length < 2_500_000
           ? o.uiBgImage
           : ''
-        : ''
+        : '',
+    sso: normalizeSsoSettings(o.sso)
   }
 }
 
@@ -444,7 +485,7 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
     'Content-Type': 'application/json; charset=utf-8',
     'Content-Length': Buffer.byteLength(data),
     'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Headers': 'Content-Type, X-Api-Key',
+    'Access-Control-Allow-Headers': 'Content-Type, X-Api-Key, Authorization',
     'Access-Control-Allow-Methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS'
   })
   res.end(data)
@@ -487,6 +528,15 @@ export type ApiServerDeps = {
   clearLogs: FullApiDeps['clearLogs']
   patchSettings: FullApiDeps['patchSettings']
   version?: string
+  /** Auth / RBAC (server mode) */
+  getUserStore?: () => UserStore | null
+  getPrintRequestStore?: () => PrintRequestStore | null
+  onApprovedPrint?: AuthApiDeps['onApprovedPrint']
+  onStartPrintJob?: AuthApiDeps['onStartPrintJob']
+  /** When true, loopback requests without credentials are treated as local admin */
+  allowLocalAdmin?: boolean
+  /** Ask host UI / adapters to reconnect all printers */
+  onReconnectDevices?: () => Promise<{ ok: boolean; message?: string }>
 }
 
 export class ApiServer {
@@ -616,6 +666,30 @@ export class ApiServer {
     return this.status()
   }
 
+  private resolveAuth(req: IncomingMessage, settings: AppSettings): AuthContext | null {
+    const users = this.deps.getUserStore?.()
+    const bearer = String(req.headers.authorization || '')
+    if (bearer.toLowerCase().startsWith('bearer ') && users) {
+      const token = bearer.slice(7).trim()
+      const payload = verifyJwt(token, users.getJwtSecret())
+      if (payload) {
+        const user = users.getById(payload.sub)
+        if (user && user.enabled) return { kind: 'user', user, payload }
+      }
+    }
+    const key = req.headers['x-api-key']
+    if (key && key === settings.apiKey) return { kind: 'apiKey' }
+
+    if (this.deps.allowLocalAdmin !== false) {
+      const ra = req.socket.remoteAddress || ''
+      if (ra === '127.0.0.1' || ra === '::1' || ra === '::ffff:127.0.0.1') {
+        // Only elevate loopback when no credential was attempted
+        if (!key && !bearer) return { kind: 'local' }
+      }
+    }
+    return null
+  }
+
   private async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const method = (req.method || 'GET').toUpperCase()
     if (method === 'OPTIONS') {
@@ -637,10 +711,144 @@ export class ApiServer {
       return
     }
 
-    const key = req.headers['x-api-key']
-    if (!key || key !== settings.apiKey) {
-      sendJson(res, 401, { ok: false, message: 'Unauthorized: missing or invalid X-Api-Key' })
+    // Login + SSO public endpoints
+    if (method === 'POST' && path === '/api/v1/auth/login') {
+      const users = this.deps.getUserStore?.()
+      const printRequests = this.deps.getPrintRequestStore?.()
+      if (!users || !printRequests) {
+        sendJson(res, 501, { ok: false, message: 'Auth not configured' })
+        return
+      }
+      await handleAuthApi({
+        method,
+        path,
+        req,
+        res,
+        auth: { kind: 'apiKey' },
+        deps: {
+          users,
+          printRequests,
+          getDevices: () =>
+            (readJsonArray(this.deps.getDevicesPath()) as DeviceRow[]).map((d) => ({
+              id: String(d.id),
+              name: String(d.name || d.id)
+            })),
+          onStartPrintJob:
+            this.deps.onStartPrintJob ||
+            this.deps.onApprovedPrint ||
+            (async () => ({ ok: false, message: '未配置' })),
+          onApprovedPrint:
+            this.deps.onStartPrintJob ||
+            this.deps.onApprovedPrint ||
+            (async () => ({ ok: false, message: '未配置' })),
+          getSso: () => normalizeSsoSettings(this.deps.getSettings().sso),
+          getApiBaseSettings: () => {
+            const s = this.deps.getSettings()
+            return { publicIp: s.publicIp, domain: s.domain, apiPort: s.apiPort }
+          }
+        },
+        sendJson,
+        readBody
+      })
       return
+    }
+
+    {
+      const users = this.deps.getUserStore?.()
+      if (users && path.startsWith('/api/v1/auth/sso')) {
+        const handled = await handleSsoPublicApi({
+          method,
+          path,
+          url,
+          req,
+          res,
+          deps: {
+            users,
+            getSso: () => normalizeSsoSettings(this.deps.getSettings().sso),
+            getApiBaseSettings: () => {
+              const s = this.deps.getSettings()
+              return { publicIp: s.publicIp, domain: s.domain, apiPort: s.apiPort }
+            }
+          },
+          sendJson,
+          readBody
+        })
+        if (handled) return
+      }
+    }
+
+    if (method === 'GET' && path === '/api/v1/auth/meta') {
+      const users = this.deps.getUserStore?.()
+      const printRequests = this.deps.getPrintRequestStore?.()
+      if (users && printRequests) {
+        await handleAuthApi({
+          method,
+          path,
+          req,
+          res,
+          auth: { kind: 'local' },
+          deps: {
+            users,
+            printRequests,
+            getDevices: () => [],
+            onApprovedPrint: async () => ({ ok: true }),
+            getSso: () => normalizeSsoSettings(this.deps.getSettings().sso),
+            getApiBaseSettings: () => {
+              const s = this.deps.getSettings()
+              return { publicIp: s.publicIp, domain: s.domain, apiPort: s.apiPort }
+            }
+          },
+          sendJson,
+          readBody
+        })
+        return
+      }
+    }
+
+    const auth = this.resolveAuth(req, settings)
+    if (!auth) {
+      sendJson(res, 401, {
+        ok: false,
+        message: 'Unauthorized: need X-Api-Key or Authorization: Bearer <jwt>'
+      })
+      return
+    }
+
+    const users = this.deps.getUserStore?.()
+    const printRequests = this.deps.getPrintRequestStore?.()
+    if (users && printRequests) {
+      const authHandled = await handleAuthApi({
+        method,
+        path,
+        req,
+        res,
+        auth,
+        deps: {
+          users,
+          printRequests,
+          getDevices: () =>
+            (readJsonArray(this.deps.getDevicesPath()) as DeviceRow[]).map((d) => ({
+              id: String(d.id),
+              name: String(d.name || d.id)
+            })),
+          onStartPrintJob:
+            this.deps.onStartPrintJob ||
+            this.deps.onApprovedPrint ||
+            (async () => ({ ok: false, message: '未配置' })),
+          onApprovedPrint:
+            this.deps.onStartPrintJob ||
+            this.deps.onApprovedPrint ||
+            (async () => ({ ok: false, message: '未配置' })),
+          getSso: () => normalizeSsoSettings(this.deps.getSettings().sso),
+          getApiBaseSettings: () => {
+            const s = this.deps.getSettings()
+            return { publicIp: s.publicIp, domain: s.domain, apiPort: s.apiPort }
+          }
+        },
+        sendJson,
+        readBody
+      })
+      if (authHandled) return
     }
 
     if (method === 'GET' && path === '/api/v1/events') {
@@ -649,7 +857,7 @@ export class ApiServer {
         'Cache-Control': 'no-cache, no-transform',
         Connection: 'keep-alive',
         'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Headers': 'Content-Type, X-Api-Key'
+        'Access-Control-Allow-Headers': 'Content-Type, X-Api-Key, Authorization'
       })
       res.write(`event: hello\ndata: ${JSON.stringify({ ok: true, time: new Date().toISOString() })}\n\n`)
       this.sseClients.add(res)
@@ -670,7 +878,8 @@ export class ApiServer {
 
     try {
       if (method === 'GET' && path === '/api/v1/summary') {
-        const devices = readJsonArray(this.deps.getDevicesPath()) as DeviceRow[]
+        let devices = readJsonArray(this.deps.getDevicesPath()) as DeviceRow[]
+        devices = filterDevicesForAuth(auth, devices)
         const spools = readJsonArray(this.deps.getFilamentPath()) as SpoolRow[]
         const statuses = this.deps.getStatuses()
         const monitor = monitorSummaryCounts(this.deps.getMonitorZonesPath())
@@ -753,6 +962,7 @@ export class ApiServer {
       if (method === 'GET' && path === '/api/v1/devices') {
         const tech = url.searchParams.get('tech')
         let devices = (readJsonArray(this.deps.getDevicesPath()) as DeviceRow[]).map(sanitizeDevice)
+        devices = filterDevicesForAuth(auth, devices as Array<{ id: string }>) as typeof devices
         if (tech === 'fdm' || tech === 'resin') {
           devices = devices.filter((d) => d.tech === tech)
         }
@@ -764,6 +974,26 @@ export class ApiServer {
             status: statuses[String(d.id)] || null
           }))
         })
+        return
+      }
+
+      if (method === 'POST' && path === '/api/v1/devices/reconnect') {
+        if (settings.apiMode !== 'control') {
+          sendJson(res, 403, { ok: false, message: 'API is in readonly mode' })
+          return
+        }
+        if (auth.kind === 'user') {
+          if (!hasPerm(effectivePermissions(auth.user), 'device.view')) {
+            sendJson(res, 403, { ok: false, message: '无权限' })
+            return
+          }
+        }
+        if (!this.deps.onReconnectDevices) {
+          sendJson(res, 501, { ok: false, message: '未配置重连' })
+          return
+        }
+        const result = await this.deps.onReconnectDevices()
+        sendJson(res, result.ok ? 200 : 502, result)
         return
       }
 
@@ -811,6 +1041,11 @@ export class ApiServer {
           })
           return
         }
+        const gate = assertDeviceControlAllowed(auth, id, body.action)
+        if (!gate.ok) {
+          sendJson(res, gate.status, { ok: false, message: gate.message })
+          return
+        }
         const result = await this.deps.onControl(id, {
           action: body.action,
           ...parseControlExtras(body)
@@ -828,6 +1063,15 @@ export class ApiServer {
         }
         const id = decodeURIComponent(filamentCtrl[1])
         const kind = filamentCtrl[2] as 'load' | 'unload'
+        const gate = assertDeviceControlAllowed(
+          auth,
+          id,
+          kind === 'load' ? 'load_filament' : 'unload_filament'
+        )
+        if (!gate.ok) {
+          sendJson(res, gate.status, { ok: false, message: gate.message })
+          return
+        }
         const raw = await readBody(req)
         let body: Record<string, unknown> = {}
         if (raw) {

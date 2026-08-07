@@ -32,6 +32,7 @@ import { AmsSlotChip } from './AmsSlotChip'
 import { BambuDevModeHelp } from './BambuDevModeHelp'
 import { CameraPanel } from './CameraPanel'
 import { useFilamentStore } from '../stores/filamentStore'
+import { useAuthStore, useAuthGrants } from '../stores/authStore'
 import { findBrand } from '../data/filamentBrands'
 import { materialLabel } from '../data/filamentMaterials'
 import {
@@ -40,10 +41,75 @@ import {
   spoolBindSlotsLeft,
   spoolRolls
 } from '../utils/spoolBinding'
+import {
+  isClientMode,
+  serverDownloadDeviceFile,
+  serverListDeviceCameras,
+  serverListDeviceFiles,
+  serverUploadDeviceFile
+} from '../api/serverClient'
+import { usePrintQueueStore, type PrintJob } from '../stores/printQueueStore'
 
 function fileNameOf(path: string): string {
   const parts = path.replace(/\\/g, '/').split('/')
   return parts[parts.length - 1] || path
+}
+
+function statusTagColor(s: string): string {
+  switch (s) {
+    case 'pending':
+      return 'gold'
+    case 'queued':
+      return 'blue'
+    case 'printing':
+      return 'processing'
+    case 'done':
+      return 'green'
+    case 'rejected':
+    case 'failed':
+      return 'red'
+    default:
+      return 'default'
+  }
+}
+
+function statusLabel(s: string): string {
+  const map: Record<string, string> = {
+    pending: '待审核',
+    queued: '排队中',
+    printing: '打印中',
+    done: '已下发',
+    rejected: '已拒绝',
+    cancelled: '已取消',
+    failed: '失败',
+    approved: '已通过'
+  }
+  return map[s] || s
+}
+
+/** Bed-clear confirmation before starting a queued print */
+export function confirmStartPrintJob(
+  job: { filename: string; deviceName?: string },
+  onOk: () => Promise<void>
+): void {
+  Modal.confirm({
+    title: '确认开始打印',
+    width: 480,
+    content: (
+      <div>
+        <Typography.Paragraph>
+          即将向 <Typography.Text strong>{job.deviceName || '打印机'}</Typography.Text> 下发：
+          <Typography.Text code>{job.filename}</Typography.Text>
+        </Typography.Paragraph>
+        <Typography.Paragraph type="warning" style={{ marginBottom: 0 }}>
+          请确认：上一盘模型已取下，打印板上没有残留模型，热床清空后再发送打印。
+        </Typography.Paragraph>
+      </div>
+    ),
+    okText: '床已清空，开始打印',
+    cancelText: '取消',
+    onOk
+  })
 }
 
 export function DeviceDetailDrawer({
@@ -72,17 +138,50 @@ export function DeviceDetailDrawer({
   const [fileBusy, setFileBusy] = useState<string | null>(null)
   const [cameras, setCameras] = useState<CameraSource[]>([])
   const [cameraLoading, setCameraLoading] = useState(false)
+  const [queueSubmitting, setQueueSubmitting] = useState(false)
   const spools = useFilamentStore((s) => s.spools)
   const bindSpoolAms = useFilamentStore((s) => s.bindSpoolAms)
   const clearSlotBinding = useFilamentStore((s) => s.clearSlotBinding)
+  const { canDevice } = useAuthGrants()
+  const authUserId = useAuthStore((s) => s.user?.id)
+  const printJobs = usePrintQueueStore((s) => s.jobs)
+  const refreshPrintQueue = usePrintQueueStore((s) => s.refresh)
+  const submitGcode = usePrintQueueStore((s) => s.submitGcode)
+  const startPrintJob = usePrintQueueStore((s) => s.start)
+  const cancelPrintJob = usePrintQueueStore((s) => s.cancel)
+  const canManageQueue = usePrintQueueStore((s) => s.canManageQueue)
 
   const adapter = deviceId ? adapters[deviceId] : undefined
+  const clientMode = isClientMode()
+
+  const deviceQueue = printJobs
+    .filter(
+      (j) =>
+        j.deviceId === deviceId &&
+        (j.status === 'queued' || j.status === 'pending' || j.status === 'printing')
+    )
+    .sort((a, b) => {
+      const ta = a.queuedAt || a.createdAt
+      const tb = b.queuedAt || b.createdAt
+      return ta.localeCompare(tb)
+    })
+
+  const myQueued = deviceQueue.find(
+    (j) => j.requesterId === authUserId && j.status === 'queued'
+  )
+
+  const canSubmitPrint =
+    Boolean(deviceId) &&
+    (canDevice(deviceId!, 'print') || canDevice(deviceId!, 'print.request'))
 
   const loadFiles = async () => {
-    if (!deviceId || !adapter) return
+    if (!deviceId) return
+    if (!clientMode && !adapter) return
     setLoadingFiles(true)
     try {
-      const list = await adapter.listFiles()
+      const list = clientMode
+        ? await serverListDeviceFiles(deviceId)
+        : await adapter!.listFiles()
       setFiles(list || [])
     } catch (err) {
       message.error(err instanceof Error ? err.message : '读取文件失败')
@@ -92,14 +191,16 @@ export function DeviceDetailDrawer({
   }
 
   const loadCameras = async () => {
-    if (!deviceId || !adapter) {
+    if (!deviceId || (!clientMode && !adapter)) {
       setCameras([])
       setCameraLoading(false)
       return
     }
     setCameraLoading(true)
     try {
-      const list = await adapter.getCameras()
+      const list = clientMode
+        ? await serverListDeviceCameras(deviceId)
+        : await adapter!.getCameras()
       setCameras(list || [])
     } catch {
       setCameras([])
@@ -113,6 +214,7 @@ export function DeviceDetailDrawer({
     setFiles([])
     void loadFiles()
     void loadCameras()
+    void refreshPrintQueue({ silent: true, deviceId })
     if (st?.fanSpeed != null) setFanPct(st.fanSpeed)
     if (st?.chamberFanSpeed != null) setChamberFanPct(st.chamberFanSpeed)
     if (st?.printSpeed != null) setSpeedPct(st.printSpeed)
@@ -121,6 +223,76 @@ export function DeviceDetailDrawer({
   }, [open, deviceId])
 
   if (!device) return null
+
+  const onSubmitToQueue = async (file: File) => {
+    const name = String(file.name || '')
+    if (!/\.gcode$/i.test(name)) {
+      message.error('仅支持上传 .gcode 文件')
+      return false
+    }
+
+    const confirmed = await new Promise<boolean>((resolve) => {
+      Modal.confirm({
+        title: '确认上传打印文件',
+        width: 480,
+        content: (
+          <div>
+            <Typography.Paragraph>
+              即将向 <Typography.Text strong>{device.name}</Typography.Text> 提交：
+              <Typography.Text code>{name}</Typography.Text>
+            </Typography.Paragraph>
+            <Typography.Paragraph type="warning" style={{ marginBottom: 0 }}>
+              请确保 G 文件是正确的，是选择了这台打印机的切片软件切片的。
+            </Typography.Paragraph>
+          </div>
+        ),
+        okText: '确认上传',
+        cancelText: '取消',
+        onOk: () => resolve(true),
+        onCancel: () => resolve(false)
+      })
+    })
+    if (!confirmed) return false
+
+    setQueueSubmitting(true)
+    try {
+      const res = await submitGcode({
+        deviceId: device.id,
+        deviceName: device.name,
+        file,
+        note: clientMode ? '客户端提交' : '本机提交'
+      })
+      if (res.queued) {
+        message.success(
+          res.queuePosition
+            ? `已加入队列，当前第 ${res.queuePosition} 位`
+            : '已加入打印队列'
+        )
+      } else {
+        message.success('已提交，等待管理员审核通过后入队')
+      }
+    } catch (err) {
+      message.error(err instanceof Error ? err.message : '提交失败')
+    } finally {
+      setQueueSubmitting(false)
+    }
+    return false
+  }
+
+  const onStartQueuedJob = (job: PrintJob) => {
+    confirmStartPrintJob(
+      { filename: job.filename, deviceName: job.deviceName || device.name },
+      async () => {
+        try {
+          await startPrintJob(job.id)
+          message.success(`已下发打印 ${job.filename}`)
+        } catch (err) {
+          message.error(err instanceof Error ? err.message : '开始打印失败')
+          throw err
+        }
+      }
+    )
+  }
 
   const run = async (action: Parameters<typeof control>[1], label: string) => {
     setBusy(true)
@@ -135,14 +307,20 @@ export function DeviceDetailDrawer({
   }
 
   const onUpload = async (file: File) => {
-    const adapter = adapters[device.id]
-    if (!adapter) {
-      message.error('设备未连接')
-      return false
+    if (!clientMode) {
+      const localAdapter = adapters[device.id]
+      if (!localAdapter) {
+        message.error('设备未连接')
+        return false
+      }
     }
     setUploading(true)
     try {
-      await adapter.uploadFile(file)
+      if (clientMode) {
+        await serverUploadDeviceFile(device.id, file)
+      } else {
+        await adapters[device.id]!.uploadFile(file)
+      }
       await window.electronAPI?.logs.append({
         time: new Date().toISOString(),
         deviceId: device.id,
@@ -171,14 +349,15 @@ export function DeviceDetailDrawer({
   }
 
   const downloadRemote = async (remotePath: string, mode: 'app' | 'as') => {
-    const adapter = adapters[device.id]
-    if (!adapter) {
+    if (!clientMode && !adapters[device.id]) {
       message.error('设备未连接')
       return
     }
     setFileBusy(remotePath)
     try {
-      const data = await adapter.downloadFile(remotePath)
+      const data = clientMode
+        ? await serverDownloadDeviceFile(device.id, remotePath)
+        : await adapters[device.id]!.downloadFile(remotePath)
       const name = fileNameOf(remotePath)
       const res =
         mode === 'as'
@@ -211,14 +390,17 @@ export function DeviceDetailDrawer({
   }
 
   const startPrint = async (remotePath: string) => {
-    const adapter = adapters[device.id]
-    if (!adapter) {
+    if (!clientMode && !adapters[device.id]) {
       message.error('设备未连接')
       return
     }
     setFileBusy(remotePath)
     try {
-      await adapter.printFile(remotePath)
+      if (clientMode) {
+        await control(device.id, { action: 'print_file', filename: remotePath })
+      } else {
+        await adapters[device.id]!.printFile(remotePath)
+      }
       await window.electronAPI?.logs.append({
         time: new Date().toISOString(),
         deviceId: device.id,
@@ -500,45 +682,51 @@ export function DeviceDetailDrawer({
 
       <Typography.Title level={5}>远程控制</Typography.Title>
       <Space wrap style={{ marginBottom: 16 }}>
-        <Popconfirm title="确认暂停打印？" onConfirm={() => void run({ action: 'pause' }, '暂停')}>
-          <Button disabled={busy}>暂停</Button>
-        </Popconfirm>
-        <Popconfirm title="确认恢复打印？" onConfirm={() => void run({ action: 'resume' }, '恢复')}>
-          <Button disabled={busy}>恢复</Button>
-        </Popconfirm>
-        <Popconfirm
-          title="确认取消打印？此操作不可恢复"
-          onConfirm={() => void run({ action: 'cancel' }, '取消')}
-        >
-          <Button danger disabled={busy}>
-            取消打印
-          </Button>
-        </Popconfirm>
-        {!isResin ? (
-          <>
-            <Button
-              danger
-              type="primary"
-              disabled={busy}
-              onClick={() => {
-                Modal.confirm({
-                  title: '紧急停止',
-                  content: '将发送紧急停止指令，确认继续？',
-                  okButtonProps: { danger: true },
-                  onOk: () => run({ action: 'emergency_stop' }, '紧急停止')
-                })
-              }}
-            >
-              紧急停止
+        {canDevice(device.id, 'pause') ? (
+          <Popconfirm title="确认暂停打印？" onConfirm={() => void run({ action: 'pause' }, '暂停')}>
+            <Button disabled={busy}>暂停</Button>
+          </Popconfirm>
+        ) : null}
+        {canDevice(device.id, 'resume') ? (
+          <Popconfirm title="确认恢复打印？" onConfirm={() => void run({ action: 'resume' }, '恢复')}>
+            <Button disabled={busy}>恢复</Button>
+          </Popconfirm>
+        ) : null}
+        {canDevice(device.id, 'cancel') ? (
+          <Popconfirm
+            title="确认取消打印？此操作不可恢复"
+            onConfirm={() => void run({ action: 'cancel' }, '取消')}
+          >
+            <Button danger disabled={busy}>
+              取消打印
             </Button>
-            <Popconfirm title="确认归零？" onConfirm={() => void run({ action: 'home' }, '归零')}>
-              <Button disabled={busy}>归零</Button>
-            </Popconfirm>
-          </>
+          </Popconfirm>
+        ) : null}
+        {!isResin && canDevice(device.id, 'emergency_stop') ? (
+          <Button
+            danger
+            type="primary"
+            disabled={busy}
+            onClick={() => {
+              Modal.confirm({
+                title: '紧急停止',
+                content: '将发送紧急停止指令，确认继续？',
+                okButtonProps: { danger: true },
+                onOk: () => run({ action: 'emergency_stop' }, '紧急停止')
+              })
+            }}
+          >
+            紧急停止
+          </Button>
+        ) : null}
+        {!isResin && canDevice(device.id, 'home') ? (
+          <Popconfirm title="确认归零？" onConfirm={() => void run({ action: 'home' }, '归零')}>
+            <Button disabled={busy}>归零</Button>
+          </Popconfirm>
         ) : null}
       </Space>
 
-      {!isResin ? (
+      {!isResin && canDevice(device.id, 'set_temp') ? (
       <Space wrap style={{ marginBottom: 12 }}>
         <InputNumber value={temp} onChange={(v) => setTemp(Number(v || 0))} addonAfter="°C" />
         <Button
@@ -558,7 +746,7 @@ export function DeviceDetailDrawer({
           热床温度
         </Button>
       </Space>
-      ) : (
+      ) : !isResin ? null : (
         <Alert
           type="info"
           showIcon
@@ -568,7 +756,7 @@ export function DeviceDetailDrawer({
         />
       )}
 
-      {!isResin ? (
+      {!isResin && (canDevice(device.id, 'filament_load') || canDevice(device.id, 'filament_unload')) ? (
         <div style={{ marginBottom: 24 }}>
           <Typography.Title level={5}>进料 / 退料</Typography.Title>
           <Space wrap align="center">
@@ -692,6 +880,94 @@ export function DeviceDetailDrawer({
           应用速度
         </Button>
       </Space>
+      ) : null}
+
+      {!isResin && canSubmitPrint ? (
+        <div style={{ marginBottom: 24 }}>
+          <Typography.Title level={5}>发送 G 文件打印</Typography.Title>
+          <Typography.Paragraph type="secondary" style={{ marginBottom: 8 }}>
+            仅支持 .gcode；提交后按权限进入该机队列（需审核则先审核）；管理员确认床清空后再开打。
+            请确保 G 文件是正确的，是选择了这台打印机的切片软件切片的。
+            {myQueued?.queuePosition ? (
+              <>
+                {' '}
+                你当前排队第 <Typography.Text strong>{myQueued.queuePosition}</Typography.Text> 位。
+              </>
+            ) : null}
+          </Typography.Paragraph>
+          <Space wrap style={{ marginBottom: 8 }}>
+            <Upload
+              accept=".gcode"
+              showUploadList={false}
+              beforeUpload={(file) => {
+                void onSubmitToQueue(file as unknown as File)
+                return false
+              }}
+            >
+              <Button type="primary" icon={<UploadOutlined />} loading={queueSubmitting}>
+                选择 .gcode 加入队列
+              </Button>
+            </Upload>
+            <Button onClick={() => void refreshPrintQueue({ silent: true, deviceId: device.id })}>
+              刷新队列
+            </Button>
+          </Space>
+          <Table
+            size="small"
+            rowKey="id"
+            pagination={false}
+            locale={{ emptyText: '本机暂无排队/待审任务' }}
+            dataSource={deviceQueue}
+            columns={[
+              {
+                title: '状态',
+                dataIndex: 'status',
+                width: 90,
+                render: (s: string, row: PrintJob) => (
+                  <Space size={4}>
+                    <Tag color={statusTagColor(s)}>{statusLabel(s)}</Tag>
+                    {s === 'queued' && row.queuePosition ? (
+                      <Typography.Text type="secondary">#{row.queuePosition}</Typography.Text>
+                    ) : null}
+                  </Space>
+                )
+              },
+              { title: '文件', dataIndex: 'filename', ellipsis: true },
+              { title: '申请人', dataIndex: 'requesterName', width: 90 },
+              {
+                title: '操作',
+                key: 'op',
+                width: 140,
+                render: (_: unknown, row: PrintJob) => (
+                  <Space size={0}>
+                    {canManageQueue() && row.status === 'queued' ? (
+                      <Button type="link" size="small" onClick={() => onStartQueuedJob(row)}>
+                        开始
+                      </Button>
+                    ) : null}
+                    {(canManageQueue() || row.requesterId === authUserId) &&
+                    (row.status === 'queued' || row.status === 'pending') ? (
+                      <Button
+                        type="link"
+                        size="small"
+                        danger
+                        onClick={() => {
+                          void cancelPrintJob(row.id)
+                            .then(() => message.success('已取消'))
+                            .catch((e) =>
+                              message.error(e instanceof Error ? e.message : '取消失败')
+                            )
+                        }}
+                      >
+                        取消
+                      </Button>
+                    ) : null}
+                  </Space>
+                )
+              }
+            ]}
+          />
+        </div>
       ) : null}
 
       <Typography.Title level={5}>{isResin ? '切片文件' : '文件'}</Typography.Title>

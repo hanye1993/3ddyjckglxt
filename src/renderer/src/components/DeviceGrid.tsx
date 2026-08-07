@@ -14,6 +14,7 @@ import { colorSwatchBorder, normalizeColor, relativeLuminance } from '../utils/c
 import { useFilamentStore } from '../stores/filamentStore'
 import { spoolBindings } from '../utils/spoolBinding'
 import type { SpoolRecord } from '../types/filament'
+import { useAuthGrants } from '../stores/authStore'
 
 type CardColor = { hex: string; label: string }
 
@@ -141,12 +142,14 @@ const DeviceCard = memo(function DeviceCard({
   device,
   selected,
   checked,
+  canOpen,
   onSelect,
   onToggle
 }: {
   device: DeviceConfig
   selected: boolean
   checked: boolean
+  canOpen: boolean
   onSelect: (id: string) => void
   onToggle: (id: string) => void
 }) {
@@ -179,12 +182,14 @@ const DeviceCard = memo(function DeviceCard({
     selected ? 'selected' : '',
     checked ? 'checked' : '',
     health === 'error' ? 'error' : '',
-    health === 'warning' ? 'warning' : ''
+    health === 'warning' ? 'warning' : '',
+    canOpen ? '' : 'view-only'
   ]
     .filter(Boolean)
     .join(' ')
 
-  const ctrlOnline = health === 'online' || health === 'warning'
+  // Card quick controls require open/control permission, not view-only
+  const ctrlOnline = canOpen && (health === 'online' || health === 'warning')
   const speedMenu: MenuProps['items'] = useMemo(() => {
     if (device.brand === 'bambu') {
       return SPEED_PRESETS_BAMBU.map((p) => ({
@@ -252,7 +257,18 @@ const DeviceCard = memo(function DeviceCard({
   }
 
   return (
-    <div className={cls} onClick={() => onSelect(device.id)}>
+    <div
+      className={cls}
+      title={canOpen ? undefined : '仅查看权限，无法打开控制面板'}
+      style={canOpen ? undefined : { cursor: 'default' }}
+      onClick={() => {
+        if (!canOpen) {
+          message.info('当前仅有查看权限，无法进入控制面板')
+          return
+        }
+        onSelect(device.id)
+      }}
+    >
       <div className="device-card-head">
         <div className="device-card-title">
           <span onClick={(e) => e.stopPropagation()} onMouseDown={(e) => e.stopPropagation()}>
@@ -434,6 +450,7 @@ export function DeviceGrid({
   const toggleStatusFilter = useDeviceStore((s) => s.toggleStatusFilter)
   const selectDevice = useDeviceStore((s) => s.selectDevice)
   const toggleChecked = useDeviceStore((s) => s.toggleChecked)
+  const { canOpenDevice } = useAuthGrants()
   const checkedSet = useMemo(() => new Set(checkedIds), [checkedIds])
   const statusFilterSet = useMemo(() => new Set(statusFilters), [statusFilters])
 
@@ -603,6 +620,7 @@ export function DeviceGrid({
                 device={device}
                 selected={selectedId === device.id}
                 checked={checkedSet.has(device.id)}
+                canOpen={canOpenDevice(device.id)}
                 onSelect={onSelect}
                 onToggle={onToggle}
               />

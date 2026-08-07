@@ -7,9 +7,13 @@
   "license": "MIT",
   "scripts": {
     "dev": "electron-vite dev",
+    "dev:server": "electron-vite dev -- --role=server",
+    "dev:client": "electron-vite dev -- --role=client",
     "build": "electron-vite build",
     "preview": "electron-vite preview",
     "dist": "npm run build && electron-builder --win",
+    "dist:server": "npm run build && electron-builder --win -c.extraMetadata.hanyeAppRole=server -c.extraMetadata.productName=hanye-监控台服务端 -c.executableName=hanye-printer-server",
+    "dist:client": "npm run build && electron-builder --win -c.extraMetadata.hanyeAppRole=client -c.extraMetadata.productName=hanye-监控台客户端 -c.executableName=hanye-printer-client",
     "sync:android": "powershell -NoProfile -ExecutionPolicy Bypass -File clients/android/sync-web.ps1",
     "typecheck": "tsc --noEmit -p tsconfig.web.json && tsc --noEmit -p tsconfig.node.json"
   },
