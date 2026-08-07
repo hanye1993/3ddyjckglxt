@@ -65,7 +65,7 @@ npm run dist:client  # 打包客户端安装包 → release/
 | Klipper / 奇迪 / 创想局域网 | Moonraker HTTP + WebSocket |
 | 拓竹 Bambu Lab | MQTT + 局域网摄像头；云端登录（仅桌面） |
 | 创想 Creality | 局域网原生 WS + 云端 |
-| 电光 Elegoo | SDCP |
+| Elegoo | SDCP |
 | 纵维 Anycubic | 局域网 + 云端 |
 | Snapmaker / 闪铸 | 局域网 |
 
